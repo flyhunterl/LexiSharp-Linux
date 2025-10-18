@@ -68,10 +68,17 @@ pip install -r requirements.txt
    环境变量优先级高于配置文件。
 
 ## 使用步骤
+### 手动启动
 ```bash
 source ~/.venvs/lexisharp/bin/activate
 python lexisharp.py
 ```
+### 使用一键脚本
+```
+chmod +x lexisharp.sh
+
+```
+arch可直接通过alt+空格键输入lexisharp.sh运行
 
 1. 激活目标应用并让光标停留在文本输入框。
 2. 回到 LexiSharp-linux，点击“开始”或使用默认热键 `Ctrl+Alt+A` 开始录音。
