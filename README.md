@@ -1,10 +1,11 @@
 # LexiSharp-linux
 
 LexiSharp-linux 是一款运行于 Linux 桌面的轻量级语音输入工具，围绕“录音 → 识别 → 粘贴”这一流程展开，实现最小成本的语音转文字体验。
+支持火山引擎、通义千问、Soniox的ASR模型。
 项目灵感来源于安卓版LexiSharp。安卓版版本已经是一个非常完善且功能强大的版本！地址：https://github.com/BryceWG/LexiSharp-Keyboard
 
 
-### 目前项目处于初级开发阶段，暂不提供执行程序.可以通过一键脚本或手动启动方式使用
+
 
 <img width="479" height="547" alt="image" src="https://github.com/user-attachments/assets/26d7d875-26da-4004-8270-305192cf16f3" />
 
@@ -15,6 +16,11 @@ LexiSharp-linux 是一款运行于 Linux 桌面的轻量级语音输入工具，
 - **结果自动复制/粘贴**：识别文本会自动写入剪贴板；启用自动粘贴后会模拟 `Ctrl+V` 将内容送入目标窗口（默认关闭，Wayland 下需要安装 `wl-clipboard`）。
 - **配置简明**：首次启动生成 `~/.lexisharp-linux/config.json` 模板，填入密钥即可使用。
 
+#  通过程序启动
+## 下载Releases最新版本
+
+
+# 从源码启动
 ## 环境准备
 ### 可使用一键脚本配置（推荐）或者手动配置
 #### 使用一键脚本
@@ -196,5 +202,9 @@ arch可直接通过alt+空格键输入lexisharp.sh运行
 - 支持更多第三方 ASR 服务或本地模型。
 - 改进 UI 体验与配置流程。
 - 提供更完善的自动粘贴兼容方案。
+
+## CI 打包发布
+- 本地打包：执行 `pyinstaller pyinstaller.spec --noconfirm --clean --distpath dist --workpath build`，可在 `dist/lexisharp/` 目录获得可执行文件。
+- GitHub Actions：仓库新增 `build-linux` 工作流，默认在推送 `v*` 标签时自动触发，也可通过 Actions 页面手动运行。构建完成后会在工作流页面生成 `lexisharp-linux` 工件，内含压缩包 `lexisharp-linux.tar.gz`。
 
 欢迎根据自身需求进行二次开发。LexiSharp-linux 希望成为可拓展的语音输入基础工具。***
