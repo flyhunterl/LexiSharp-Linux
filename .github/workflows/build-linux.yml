@@ -5,6 +5,15 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      include_release:
+        description: '是否生成 GitHub Release（需要先创建对应标签）'
+        required: false
+        default: 'false'
+      tag_name:
+        description: '手动触发时要发布的标签名（例如 v1.2.3），需已存在'
+        required: false
+        default: ''
 
 jobs:
   build:
@@ -45,3 +54,14 @@ jobs:
           path: |
             lexisharp-linux.tar.gz
           if-no-files-found: error
+
+      - name: 发布 GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.include_release == 'true' && (github.event.inputs.tag_name || '') != '')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag_name || github.ref_name }}
+          release_name: LexiSharp-linux ${{ github.event.inputs.tag_name || github.ref_name }}
+          generate_release_notes: true
+          files: lexisharp-linux.tar.gz
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.event.inputs.tag_name || github.ref_name, '-rc') || contains(github.event.inputs.tag_name || github.ref_name, '-beta') || contains(github.event.inputs.tag_name || github.ref_name, '-alpha') }}
