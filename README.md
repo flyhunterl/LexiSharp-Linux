@@ -16,7 +16,8 @@ LexiSharp-linux 是一款运行于 Linux 桌面的轻量级语音输入工具，
 - **配置简明**：首次启动生成 `~/.lexisharp-linux/config.json` 模板，填入密钥即可使用。
 
 ## 环境准备
-### 使用一键脚本
+### 可使用一键脚本配置（推荐）或者手动配置
+#### 使用一键脚本
 
 添加权限
 ```bash
@@ -28,7 +29,7 @@ chmod +x setup_lexisharp.sh
 ./setup_lexisharp.sh
 ```
 
-### 手动安装
+####  手动安装
 以 Arch/Manjaro 为例：
 ```bash
 sudo pacman -S python python-pip alsa-utils xdotool wl-clipboard xclip tk
@@ -57,8 +58,9 @@ pip install -r requirements.txt
 
 
 ## 识别渠道配置
+
 ### 通过设置界面设置
-当前版本已支持可视化设置，通过设置按钮进入设置
+当前版本已支持可视化设置，通过设置按钮进入设置，如需更多的设置可以参考下面手动配置。
 
 ### 手动配置
 通过 `~/.lexisharp-linux/config.json` 中的 `channel` 字段选择识别服务：
@@ -130,12 +132,15 @@ pip install -r requirements.txt
 4. 当识别完成后，程序会自动清理已上传的文件与任务，可在日志中查看对应的 `client_reference_id`（与请求一致）。若需要更多参数示例，可参考官方文档：https://soniox.com/docs/stt/async/async-transcription
 
 ## 使用步骤
-### 手动启动
+
+### 当前项目初级极端更新频繁，暂不提供程序启动，请手动启动或者通过脚本启动程序。
+
+#### 手动启动
 ```bash
 source ~/.venvs/lexisharp/bin/activate
 python lexisharp.py
 ```
-### 使用一键脚本
+####  使用一键脚本
 ```
 chmod +x lexisharp.sh
 
