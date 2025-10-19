@@ -13,8 +13,19 @@ LexiSharp-linux 是一款运行于 Linux 桌面的轻量级语音输入工具，
 - **配置简明**：首次启动生成 `~/.lexisharp-linux/config.json` 模板，填入密钥即可使用。
 
 ## 环境准备
+### 使用一键脚本
 
-### 1. 系统依赖
+添加权限
+```bash
+chmod +x setup_lexisharp.sh
+```
+
+运行脚本
+```bash
+./setup_lexisharp.sh
+```
+
+### 手动安装
 以 Arch/Manjaro 为例：
 ```bash
 sudo pacman -S python python-pip alsa-utils xdotool xclip tk
