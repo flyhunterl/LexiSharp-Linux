@@ -38,9 +38,9 @@ fi
 
 if [ -z "$OS_TYPE" ]; then
     echo "⚠️  抱歉，未能识别您的操作系统类型。请您手动安装系统依赖。 "
-    echo "    - Arch/Manjaro: sudo pacman -S python python-pip alsa-utils xdotool xclip tk"
-    echo "    - Debian/Ubuntu: sudo apt update && sudo apt install python3 python3-venv python3-pip alsa-utils xdotool xclip"
-    echo "    - Fedora/RHEL: sudo dnf install python3 python3-pip python3-virtualenv alsa-utils xdotool xclip python3-tkinter"
+    echo "    - Arch/Manjaro: sudo pacman -S python python-pip alsa-utils xdotool wl-clipboard xclip tk"
+    echo "    - Debian/Ubuntu: sudo apt update && sudo apt install python3 python3-venv python3-pip alsa-utils xdotool wl-clipboard xclip"
+    echo "    - Fedora/RHEL: sudo dnf install python3 python3-pip python3-virtualenv alsa-utils xdotool wl-clipboard xclip python3-tkinter"
     echo "脚本已终止。"
     exit 1
 fi
@@ -50,13 +50,13 @@ echo "    准备安装系统依赖，这可能需要您的 sudo 密码..."
 
 case "$OS_TYPE" in
     debian)
-        sudo apt update && sudo apt install -y python3 python3-venv python3-pip alsa-utils xdotool xclip python3-tk
+        sudo apt update && sudo apt install -y python3 python3-venv python3-pip alsa-utils xdotool wl-clipboard xclip python3-tk
         ;;
     fedora)
-        sudo dnf install -y python3 python3-pip python3-virtualenv alsa-utils xdotool xclip python3-tkinter
+        sudo dnf install -y python3 python3-pip python3-virtualenv alsa-utils xdotool wl-clipboard xclip python3-tkinter
         ;;
     arch)
-        sudo pacman -S --noconfirm python python-pip alsa-utils xdotool xclip tk
+        sudo pacman -S --noconfirm python python-pip alsa-utils xdotool wl-clipboard xclip tk
         ;;
     *)
         echo "⚠️  未知操作系统类型，请手动安装系统依赖。脚本已终止。"
@@ -69,6 +69,7 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 echo "✅ 系统依赖安装完成！"
+echo "ℹ️  若在 Wayland 下启用自动粘贴，请确保当前用户已加入 input 组（sudo usermod -aG input \$USER，并重新登录）。"
 
 # --- 2. 创建并设置虚拟环境 ---
 echo "--------------------------------------------------------"

@@ -4,11 +4,12 @@
 LexiSharp-linux 主程序：通过录音 + 火山引擎极速版ASR实现一键语音输入。
 """
 
-import base64
 import audioop
+import base64
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -17,7 +18,7 @@ import time
 import wave
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 from uuid import uuid4
 
 import tkinter as tk
@@ -26,6 +27,12 @@ from tkinter import messagebox, ttk
 import pyperclip
 import requests
 from pynput import keyboard as pynput_keyboard
+
+try:
+    from evdev import UInput, ecodes
+except ImportError:  # pragma: no cover - 处理运行时缺失
+    UInput = None
+    ecodes = None
 
 # 配置文件路径
 CONFIG_DIR = Path.home() / ".lexisharp-linux"
@@ -39,7 +46,7 @@ CONFIG_TEMPLATE = {
     "access_key": "在此填写Access Key",
     "resource_id": "volc.bigasr.auc_turbo",
     "model_name": "bigmodel",
-    "auto_paste": False,
+    "auto_paste": True,
     "paste_delay_ms": 200,
     "max_wait_s": 45,
     "log_level": "INFO",
@@ -143,6 +150,257 @@ def current_active_window() -> Optional[str]:
         return None
 
 
+class ClipboardHelper:
+    """
+    统一管理剪贴板操作，根据当前桌面环境自动选择工具。
+    """
+
+    def __init__(self, logger: Optional[logging.Logger] = None):
+        parent_logger = logger or logging.getLogger("lexisharp")
+        self.logger = parent_logger.getChild("clipboard")
+        self._wl_copy_processes: List[subprocess.Popen] = []
+
+    @staticmethod
+    def _is_wayland() -> bool:
+        return bool(os.environ.get("WAYLAND_DISPLAY"))
+
+    @staticmethod
+    def _which(command: str) -> Optional[str]:
+        return shutil.which(command)
+
+    def _cleanup_wl_copy_processes(self) -> None:
+        """
+        回收已结束的 wl-copy 进程，避免产生僵尸进程。
+        """
+        alive: List[subprocess.Popen] = []
+        for proc in self._wl_copy_processes:
+            if proc.poll() is None:
+                alive.append(proc)
+                continue
+            try:
+                proc.wait(timeout=0)
+            except Exception:
+                self.logger.debug("回收 wl-copy 子进程时出现异常", exc_info=True)
+        self._wl_copy_processes = alive
+
+    def copy(self, text: str | None) -> bool:
+        """
+        将文本写入剪贴板，优先使用 wl-copy，其次回退到 pyperclip。
+        """
+        payload = text if isinstance(text, str) else str(text or "")
+        if self._is_wayland():
+            wl_copy = self._which("wl-copy")
+            if wl_copy:
+                self._cleanup_wl_copy_processes()
+                try:
+                    self.logger.info("Wayland 环境检测到，调用 wl-copy 写入剪贴板，字符数=%d", len(payload))
+                    process = subprocess.Popen(
+                        [wl_copy, "--trim-newline"],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE
+                    )
+                except FileNotFoundError:
+                    self.logger.error("未找到 wl-copy 命令，请确认 wl-clipboard 是否已安装。")
+                except OSError as exc:
+                    self.logger.error("启动 wl-copy 失败：%s", exc)
+                except Exception:
+                    self.logger.exception("wl-copy 写入剪贴板时发生异常")
+                else:
+                    try:
+                        _, stderr_data = process.communicate(
+                            payload.encode("utf-8"),
+                            timeout=0.3
+                        )
+                    except subprocess.TimeoutExpired:
+                        self.logger.info("wl-copy 写入剪贴板成功，进程将继续在后台托管内容。")
+                        self._wl_copy_processes.append(process)
+                        return True
+                    except Exception:
+                        process.kill()
+                        process.communicate()
+                        self.logger.exception("wl-copy 写入剪贴板时发生异常")
+                    else:
+                        stderr_text = (
+                            stderr_data.decode("utf-8", errors="ignore") if stderr_data else ""
+                        )
+                        if process.returncode == 0:
+                            self.logger.info("wl-copy 写入剪贴板成功")
+                            return True
+                        self.logger.error(
+                            "wl-copy 执行失败（返回码=%s）：%s",
+                            process.returncode,
+                            stderr_text.strip()
+                        )
+            else:
+                self.logger.warning("Wayland 环境下未检测到 wl-copy，可安装 wl-clipboard 获得最佳体验。")
+
+        try:
+            self.logger.info("回退至 pyperclip 写入剪贴板，字符数=%d", len(payload))
+            pyperclip.copy(payload)
+        except pyperclip.PyperclipException:
+            self.logger.exception("pyperclip 写入剪贴板失败")
+            return False
+        except Exception:
+            self.logger.exception("写入剪贴板时出现未知异常")
+            return False
+        else:
+            self.logger.info("pyperclip 写入剪贴板成功")
+            return True
+
+    def paste(self) -> str:
+        """
+        从剪贴板读取文本，Wayland 优先使用 wl-paste。
+        """
+        if self._is_wayland():
+            wl_paste = self._which("wl-paste")
+            if wl_paste:
+                try:
+                    self.logger.info("Wayland 环境检测到，调用 wl-paste 读取剪贴板内容")
+                    result = subprocess.run(
+                        [wl_paste, "--no-newline"],
+                        check=True,
+                        capture_output=True,
+                        text=True
+                    )
+                    text = result.stdout
+                except subprocess.CalledProcessError as exc:
+                    stderr = exc.stderr.strip() if exc.stderr else ""
+                    self.logger.error("wl-paste 执行失败（返回码=%s）：%s", exc.returncode, stderr)
+                except FileNotFoundError:
+                    self.logger.error("未找到 wl-paste 命令，请确认 wl-clipboard 是否已安装。")
+                except Exception:
+                    self.logger.exception("wl-paste 读取剪贴板时发生异常")
+                else:
+                    self.logger.info("wl-paste 读取剪贴板成功，字符数=%d", len(text))
+                    return text
+            else:
+                self.logger.warning("Wayland 环境下未检测到 wl-paste，可安装 wl-clipboard 获得最佳体验。")
+
+        try:
+            self.logger.info("回退至 pyperclip 读取剪贴板内容")
+            text = pyperclip.paste()
+        except pyperclip.PyperclipException:
+            self.logger.exception("pyperclip 读取剪贴板失败")
+            return ""
+        except Exception:
+            self.logger.exception("读取剪贴板时发生未知异常")
+            return ""
+        else:
+            if text is None:
+                text = ""
+            self.logger.info("pyperclip 读取剪贴板成功，字符数=%d", len(text))
+            return text
+
+
+class InputInjector:
+    """
+    在不同图形栈下注入键盘事件，Wayland 环境优先使用 uinput。
+    """
+
+    def __init__(self, logger: Optional[logging.Logger] = None):
+        parent_logger = logger or logging.getLogger("lexisharp")
+        self.logger = parent_logger.getChild("injector")
+        self.is_wayland = bool(os.environ.get("WAYLAND_DISPLAY"))
+        self.mode = "none"
+        self._uinput: Optional["UInput"] = None
+        if self.is_wayland:
+            self._init_uinput()
+        else:
+            self.logger.debug("检测到非 Wayland 会话，保持默认 xdotool 注入模式。")
+
+    def _init_uinput(self) -> None:
+        """
+        初始化 uinput 虚拟键盘。
+        """
+        if UInput is None or ecodes is None:
+            self.logger.warning(
+                "未安装 python-evdev，无需启用 uinput。请运行 `pip install evdev`。"
+            )
+            return
+        uinput_path = Path("/dev/uinput")
+        if not uinput_path.exists():
+            self.logger.warning("未找到 /dev/uinput，无法启用虚拟键盘，请检查内核模块。")
+            return
+        if not os.access(uinput_path, os.W_OK):
+            self.logger.warning(
+                "/dev/uinput 无写权限，请将当前用户加入 input 组或调整 udev 规则。"
+            )
+            return
+        capabilities = {
+            # 仅声明需要的键位，其他事件类型由驱动自动处理，避免出现 Invalid argument。
+            ecodes.EV_KEY: [
+                ecodes.KEY_LEFTCTRL,
+                ecodes.KEY_RIGHTCTRL,
+                ecodes.KEY_V,
+            ],
+        }
+        try:
+            self._uinput = UInput(capabilities, name="LexiSharp Virtual Keyboard")
+        except PermissionError as exc:
+            self.logger.error("创建 uinput 虚拟键盘失败（权限不足）：%s", exc)
+            self._uinput = None
+        except OSError:
+            self.logger.exception("创建 uinput 虚拟键盘失败")
+            self._uinput = None
+        else:
+            self.mode = "uinput"
+            self.logger.info("uinput 虚拟键盘初始化完成，自动粘贴将通过 Ctrl+V 注入。")
+
+    def can_use_uinput(self) -> bool:
+        """
+        判断是否可使用 uinput 注入。
+        """
+        return self.mode == "uinput" and self._uinput is not None
+
+    def inject_ctrl_v(self, wait_ms: int = 0) -> bool:
+        """
+        通过 uinput 发出 Ctrl+V 快捷键。
+        """
+        if not self.can_use_uinput():
+            return False
+        delay = max(0.0, wait_ms / 1000.0)
+        if delay > 0:
+            self.logger.debug("延时 %.3f 秒后发送 Ctrl+V。", delay)
+            time.sleep(delay)
+        try:
+            self._emit_key(ecodes.KEY_LEFTCTRL, 1)
+            time.sleep(0.01)
+            self._emit_key(ecodes.KEY_V, 1)
+            time.sleep(0.02)
+            self._emit_key(ecodes.KEY_V, 0)
+            time.sleep(0.01)
+            self._emit_key(ecodes.KEY_LEFTCTRL, 0)
+            time.sleep(0.01)
+            self.logger.info("已通过 uinput 发送 Ctrl+V 快捷键。")
+            return True
+        except Exception:
+            self.logger.exception("uinput 发送 Ctrl+V 时发生异常")
+            return False
+
+    def _emit_key(self, key_code: int, value: int) -> None:
+        """
+        写入单个按键事件。
+        """
+        if not self._uinput:
+            raise RuntimeError("uinput 未初始化。")
+        self._uinput.write(ecodes.EV_KEY, key_code, value)
+        self._uinput.write(ecodes.EV_SYN, ecodes.SYN_REPORT, 0)
+        self._uinput.syn()
+
+    def close(self) -> None:
+        """
+        关闭并释放虚拟键盘。
+        """
+        if self._uinput:
+            try:
+                self._uinput.close()
+                self.logger.info("已释放 uinput 虚拟键盘设备。")
+            except Exception:
+                self.logger.exception("释放 uinput 虚拟键盘失败")
+            finally:
+                self._uinput = None
+                self.mode = "none"
 class Recorder:
     """
     基于 arecord 的简易录音器。
@@ -497,6 +755,8 @@ class LexiSharpApp:
         self.root = root
         self.config = config
         self.logger = logger
+        self.clipboard = ClipboardHelper(logger=self.logger)
+        self.input_injector = InputInjector(logger=self.logger)
         self.start_hotkey = (self.config.get("start_hotkey") or "").strip()
         self.stop_hotkey = (self.config.get("stop_hotkey") or "").strip()
         self.hotkey_manager: Optional[GlobalHotkeyManager] = None
@@ -571,7 +831,7 @@ class LexiSharpApp:
 
         instruction = (
             "操作说明：点击下方按钮开始录音，再次点击结束并识别。\n"
-            "识别成功后文本会复制到剪贴板，请自行粘贴到目标窗口。\n"
+            "识别成功后文本会复制到节铁板，并且自动粘贴到目标窗口。\n"
             "可在下方启用“显示浮动录音按钮”以使用可拖动的置顶录音键。"
             f"{hotkey_info}"
         )
@@ -706,7 +966,7 @@ class LexiSharpApp:
         """
         开始录音。
         """
-        self.logger.info("开始录音（已停用窗口自动检测）")
+        self.logger.info("开始录音。")
         try:
             self.audio_path = self.recorder.start()
         except RuntimeError as exc:
@@ -757,20 +1017,22 @@ class LexiSharpApp:
             self.logger.info("ASR 返回文本：%s", text)
             self._refresh_result(text)
 
-            copy_message = "识别完成，内容已复制到剪贴板。"
-            copied = True
-            try:
-                pyperclip.copy(text)
-                self.logger.info("文本已复制到剪贴板")
-            except pyperclip.PyperclipException:
-                self.logger.exception("复制到剪贴板失败")
-                copy_message = "识别成功，但无法复制到剪贴板，请安装 xclip 或 xsel。"
-                copied = False
+            copy_success_message = "识别完成，内容已复制到剪贴板。"
+            auto_paste_message = "识别完成，内容已复制到剪贴板，并自动粘贴到目标窗口。"
+            copy_message = copy_success_message
+            copied = self.clipboard.copy(text)
+            if not copied:
+                copy_message = (
+                    "识别成功，但无法复制到剪贴板，请安装 wl-clipboard（Wayland）或 xclip/xsel（X11）。"
+                )
 
             if copied:
                 if self.config.get("auto_paste", False):
-                    self._auto_paste_async()
-                    self._update_status(copy_message)
+                    pasted = self._auto_paste_async()
+                    if pasted:
+                        self._update_status(auto_paste_message)
+                    else:
+                        self._update_status("识别完成，内容已复制到剪贴板，请手动粘贴。")
                 else:
                     self._update_status("识别完成，内容已复制到剪贴板，请手动粘贴。")
             else:
@@ -856,18 +1118,32 @@ class LexiSharpApp:
         self.logger.debug("ASR 原始数据：%s", data)
         return text.strip() or None
 
-    def _auto_paste_async(self) -> None:
+    def _auto_paste_async(self) -> bool:
         """
         自动激活目标窗口并触发粘贴。
+
+        返回：
+            bool: True 表示成功触发自动粘贴，False 表示失败或已回退。
         """
-        if not self.target_window:
-            self.logger.warning("无法自动粘贴：缺少目标窗口")
-            self._update_status("缺少目标窗口，已复制文本，请手动粘贴。")
-            return
         try:
-            text = self.last_result_text or pyperclip.paste()
+            text_source = "缓存结果" if self.last_result_text else "剪贴板"
+            text = self.last_result_text or self.clipboard.paste()
             if not text:
                 raise subprocess.CalledProcessError(returncode=1, cmd="xdotool type --window ...")
+
+            self.logger.info("自动粘贴文本来源：%s，字符数=%d", text_source, len(text))
+            paste_wait_ms = max(0, int(self.config.get("paste_delay_ms", 200)))
+            if self.input_injector and self.input_injector.can_use_uinput():
+                self.logger.info("尝试通过 uinput 注入 Ctrl+V，等待 %d ms。", paste_wait_ms)
+                if self.input_injector.inject_ctrl_v(wait_ms=paste_wait_ms):
+                    self.logger.info("uinput 自动粘贴流程完成。")
+                    return True
+                self.logger.warning("uinput 自动粘贴失败，将回退至 xdotool。")
+
+            if not self.target_window:
+                self.logger.warning("无法自动粘贴：缺少目标窗口")
+                self._update_status("缺少目标窗口，已复制文本，请手动粘贴。")
+                return False
 
             delay_ms = max(1, int(self.config.get("type_delay_ms", 5)))
             self.logger.info("准备向窗口 %s (%s) 模拟键入，字符数=%d",
@@ -889,15 +1165,21 @@ class LexiSharpApp:
             )
             if result.returncode == 0:
                 self.logger.info("已向窗口 %s 模拟键入文本", self.target_window)
-                return
+                return True
 
             raise subprocess.CalledProcessError(returncode=result.returncode, cmd="xdotool type")
         except FileNotFoundError:
             self.logger.exception("自动粘贴失败：未找到 xdotool")
             self._update_status("未找到 xdotool，无法自动粘贴，请手动处理。")
+            return False
         except subprocess.CalledProcessError as exc:
             self.logger.exception("自动粘贴执行失败")
             self._update_status(f"自动粘贴失败：{exc}")
+            return False
+        except Exception:
+            self.logger.exception("自动粘贴流程出现未知异常")
+            self._update_status("自动粘贴失败，已复制文本，请手动粘贴。")
+            return False
 
     def _refresh_result(self, text: str) -> None:
         """
@@ -1057,9 +1339,27 @@ class LexiSharpApp:
 
     def prime_external_window(self) -> None:
         """
-        在焦点切换前记录当前外部窗口 ID（已禁用自动窗口侦测）。
+        在焦点切换前记录当前外部窗口 ID。
         """
-        self.logger.debug("prime_external_window 被调用，但窗口侦测已停用。")
+        if self.input_injector and self.input_injector.can_use_uinput():
+            # Wayland 下依赖 uinput，无需记录窗口 ID。
+            self.logger.debug("已启用 uinput 自动粘贴，跳过窗口记录。")
+            self.target_window = None
+            return
+
+        window_id = current_active_window()
+        if not window_id:
+            self.logger.debug("未能获取当前窗口，可能未安装 xdotool。")
+            return
+        if window_id in self._own_windows:
+            self.logger.debug("当前窗口属于 LexiSharp，自行忽略：%s", window_id)
+            return
+        if window_id == self._last_external_window:
+            self.logger.debug("外部窗口保持不变：%s", window_id)
+        else:
+            self.logger.info("记录外部窗口：%s (%s)", window_id, self._window_name(window_id))
+        self.target_window = window_id
+        self._last_external_window = window_id
 
     def _on_main_button_press(self, _event) -> None:
         """
@@ -1115,6 +1415,7 @@ class LexiSharpApp:
                 self.recorder.is_running()
             )
             return
+        self.prime_external_window()
         self.start_recording()
 
     def _stop_from_hotkey(self) -> None:
@@ -1148,6 +1449,9 @@ class LexiSharpApp:
             self.hotkey_manager = None
 
         self._destroy_floating_button()
+
+        if self.input_injector:
+            self.input_injector.close()
 
         if self.recorder.is_running():
             path = self.recorder.stop()
