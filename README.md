@@ -57,6 +57,9 @@ pip install -r requirements.txt
 
 
 ## 火山引擎配置
+
+火山引擎配置入口参考：https://www.llingfei.com/695.html
+
 1. 在火山引擎控制台开启 **大模型录音文件极速版识别** 能力，获取：
    - `app_key`（App ID）
    - `access_key`
