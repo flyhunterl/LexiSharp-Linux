@@ -4,7 +4,7 @@ import pathlib
 
 block_cipher = None
 
-project_dir = pathlib.Path(__file__).resolve().parent
+project_dir = pathlib.Path.cwd()
 
 a = Analysis(
     ['lexisharp.py'],
