@@ -11,7 +11,7 @@ LexiSharp-linux 是一款运行于 Linux 桌面的轻量级语音输入工具，
 
 ## 功能概览
 - **一键录音**：主界面仅保留“开始/停止录音”按钮，同时可选启用悬浮按钮（置顶、可拖拽）。
-- **极速转写**：集成火山引擎大模型录音文件极速版识别 API。
+- **极速转写**：集成火山引擎大模型录音文件极速版识别 API，并可选择 Soniox 等渠道。
 - **结果自动复制/粘贴**：识别文本会自动写入剪贴板；启用自动粘贴后会模拟 `Ctrl+V` 将内容送入目标窗口（默认关闭，Wayland 下需要安装 `wl-clipboard`）。
 - **配置简明**：首次启动生成 `~/.lexisharp-linux/config.json` 模板，填入密钥即可使用。
 
@@ -56,39 +56,78 @@ pip install -r requirements.txt
 > 若在 Wayland 环境启用 `auto_paste`，请确保已安装 `wl-clipboard`（Arch使用 `paru -S wl-clipboard`安装））。程序会通过 `python-evdev`（已在 `requirements.txt` 中）创建虚拟键盘自动发送 `Ctrl+V`。 
 
 
-## 火山引擎配置
+## 识别渠道配置
+### 通过设置界面设置
+当前版本已支持可视化设置，通过设置按钮进入设置
+
+### 手动配置
+通过 `~/.lexisharp-linux/config.json` 中的 `channel` 字段选择识别服务：
+
+- `volcengine`（默认）：火山引擎大模型录音文件极速版 API。
+- `soniox`：Soniox Speech-to-Text Async API（参考 https://soniox.com/docs/stt/get-started）。
+
+首次运行 `python lexisharp.py` 会生成配置模板，核心字段示例如下（Soniox 相关字段在使用火山引擎时可保持默认）：
+
+```json
+{
+  "api_url": "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash",
+  "app_key": "你的AppID",
+  "access_key": "你的AccessKey",
+  "resource_id": "volc.bigasr.auc_turbo",
+  "model_name": "bigmodel",
+  "channel": "volcengine",
+  "soniox_api_base": "https://api.soniox.com",
+  "soniox_api_key": "你的SonioxAPIKey",
+  "soniox_model": "stt-async-preview",
+  "soniox_language_hints": [],
+  "soniox_enable_speaker_diarization": false,
+  "soniox_enable_language_identification": false,
+  "soniox_context": "",
+  "soniox_poll_interval_s": 1.0,
+  "soniox_poll_timeout_s": 120.0,
+  "auto_paste": true,
+  "paste_delay_ms": 200,
+  "max_wait_s": 45,
+  "log_level": "INFO",
+  "arecord_device": "plughw:1,0",
+  "start_hotkey": "ctrl+alt+a",
+  "stop_hotkey": "ctrl+alt+s",
+  "floating_button_enabled": true,
+  "floating_button_size": 60,
+  "type_delay_ms": 5
+}
+```
+
+### 火山引擎（volcengine）
 
 火山引擎配置入口参考：https://www.llingfei.com/695.html
 
 1. 在火山引擎控制台开启 **大模型录音文件极速版识别** 能力，获取：
    - `app_key`（App ID）
    - `access_key`
-2. 首次运行 `python lexisharp.py` 会在 `~/.lexisharp-linux/config.json` 生成配置模板，字段说明：
-   ```json
-   {
-     "api_url": "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash",
-     "app_key": "你的AppID",
-     "access_key": "你的AccessKey",
-     "resource_id": "volc.bigasr.auc_turbo",
-     "model_name": "bigmodel",
-     "auto_paste": true,
-     "paste_delay_ms": 200,
-     "max_wait_s": 45,
-     "log_level": "INFO",
-     "arecord_device": "plughw:1,0",
-     "start_hotkey": "ctrl+alt+a",
-     "stop_hotkey": "ctrl+alt+s",
-     "floating_button_enabled": true,
-     "floating_button_size": 60,
-     "type_delay_ms": 5
-   }
-   ```
+2. 将 `channel` 保持为 `volcengine`，填写上述密钥信息即可。
 3. 如果偏好环境变量，可在启动前设置：
    ```bash
    export LEXISHARP_APP_KEY=你的AppID
    export LEXISHARP_ACCESS_KEY=你的AccessKey
    ```
    环境变量优先级高于配置文件。
+
+### Soniox（soniox）
+
+1. 访问 [Soniox Console](https://console.soniox.com) 创建项目并生成 API Key。
+2. 在配置文件中将 `channel` 改为 `soniox`，并填写 `soniox_api_key`；可按需调整模型和扩展参数：
+   - `soniox_model`：默认使用官方推荐的 `stt-async-preview`。
+   - `soniox_language_hints`：可选的语言提示列表（如 `["zh", "en"]`），有助于提升准确率。
+   - `soniox_enable_speaker_diarization` / `soniox_enable_language_identification`：开启说话人区分或语言识别。
+   - `soniox_context`：上下文提示文本，最长 10K 字符，用于辅助识别专有名词。
+   - `soniox_poll_interval_s` / `soniox_poll_timeout_s`：控制轮询间隔与超时时间（秒）。
+3. Soniox 也支持通过环境变量传参（优先级高于配置文件）：
+   ```bash
+   export SONIOX_API_KEY=你的SonioxAPIKey
+   export SONIOX_MODEL=stt-async-preview
+   ```
+4. 当识别完成后，程序会自动清理已上传的文件与任务，可在日志中查看对应的 `client_reference_id`（与请求一致）。若需要更多参数示例，可参考官方文档：https://soniox.com/docs/stt/async/async-transcription
 
 ## 使用步骤
 ### 手动启动

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-LexiSharp-linux 主程序：通过录音 + 火山引擎极速版ASR实现一键语音输入。
+LexiSharp-linux 主程序：通过录音 + 多种云端 ASR（火山引擎、Soniox 等）实现一键语音输入。
 """
 
 import audioop
@@ -40,12 +40,24 @@ CONFIG_PATH = CONFIG_DIR / "config.json"
 LOG_PATH = CONFIG_DIR / "lexisharp.log"
 
 # 默认配置模板
+NEW_CONFIG_CREATED = False
+
 CONFIG_TEMPLATE = {
     "api_url": "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash",
     "app_key": "在此填写APP ID",
     "access_key": "在此填写Access Key",
     "resource_id": "volc.bigasr.auc_turbo",
     "model_name": "bigmodel",
+    "channel": "volcengine",
+    "soniox_api_base": "https://api.soniox.com",
+    "soniox_api_key": "在此填写Soniox API Key",
+    "soniox_model": "stt-async-preview",
+    "soniox_language_hints": [],
+    "soniox_enable_speaker_diarization": False,
+    "soniox_enable_language_identification": False,
+    "soniox_context": "",
+    "soniox_poll_interval_s": 1.0,
+    "soniox_poll_timeout_s": 120.0,
     "auto_paste": True,
     "paste_delay_ms": 200,
     "max_wait_s": 45,
@@ -63,15 +75,14 @@ def ensure_config() -> dict:
     """
     确保配置文件存在并返回配置内容。
     """
+    global NEW_CONFIG_CREATED
     if not CONFIG_PATH.exists():
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(
             json.dumps(CONFIG_TEMPLATE, indent=2, ensure_ascii=False),
             encoding="utf-8"
         )
-        raise RuntimeError(
-            f"已在 {CONFIG_PATH} 生成配置模板，请补全火山引擎密钥后重新启动。"
-        )
+        NEW_CONFIG_CREATED = True
     with CONFIG_PATH.open("r", encoding="utf-8") as f:
         config = json.load(f)
     updated = False
@@ -792,11 +803,14 @@ class LexiSharpApp:
         self.level_var = tk.DoubleVar(value=0.0)
         self.last_result_text: str = ""
         self.original_window_before_record: Optional[str] = None
+        self.settings_dialog: Optional["SettingsDialog"] = None
+        self.config_ready: bool = False
+        self._config_prompt_shown: bool = False
 
         self._build_ui()
         self._update_floating_controls_state()
         self._schedule_level_update()
-        self._validate_keys()
+        self._validate_keys(initial=NEW_CONFIG_CREATED)
         self._init_hotkeys()
         if self.floating_enabled_var.get():
             self._create_floating_button()
@@ -815,12 +829,24 @@ class LexiSharpApp:
         font_title = ("WenQuanYi Micro Hei", 16, "bold")
         font_body = ("WenQuanYi Micro Hei", 12)
 
+        header_frame = tk.Frame(self.root)
+        header_frame.pack(fill=tk.X, pady=(20, 10), padx=20)
+
         title_label = tk.Label(
-            self.root,
+            header_frame,
             text="LexiSharp-linux",
             font=font_title
         )
-        title_label.pack(pady=(20, 10))
+        title_label.pack(side=tk.LEFT)
+
+        settings_button = tk.Button(
+            header_frame,
+            text="设置",
+            command=self._open_settings,
+            font=("WenQuanYi Micro Hei", 11),
+            width=8
+        )
+        settings_button.pack(side=tk.RIGHT)
 
         hotkey_info = ""
         if self.start_hotkey and self.stop_hotkey:
@@ -831,7 +857,7 @@ class LexiSharpApp:
 
         instruction = (
             "操作说明：点击下方按钮开始录音，再次点击结束并识别。\n"
-            "识别成功后文本会复制到节铁板，并且自动粘贴到目标窗口。\n"
+            "识别成功后文本会复制到剪贴板，并且自动粘贴到目标窗口。\n"
             "可在下方启用“显示浮动录音按钮”以使用可拖动的置顶录音键。"
             f"{hotkey_info}"
         )
@@ -842,9 +868,9 @@ class LexiSharpApp:
             justify=tk.LEFT,
             font=font_body
         )
-        instruction_label.pack(pady=(0, 10))
+        instruction_label.pack(pady=(0, 10), padx=20)
 
-        record_button = tk.Button(
+        self.record_button = tk.Button(
             self.root,
             textvariable=self.button_text,
             command=self.toggle_recording,
@@ -855,7 +881,7 @@ class LexiSharpApp:
             fg="white",
             activebackground="#45A049"
         )
-        record_button.pack(pady=10)
+        self.record_button.pack(pady=10)
 
         floating_frame = tk.Frame(self.root)
         floating_frame.pack(pady=(4, 0))
@@ -929,31 +955,71 @@ class LexiSharpApp:
         )
         result_display.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
 
-    def _validate_keys(self) -> None:
+    def _collect_missing_fields(self, config: dict) -> tuple[list[str], str]:
         """
-        确认密钥是否已经配置。
+        根据指定配置收集缺失的必填字段，并返回渠道标识。
         """
-        app_key = os.environ.get("LEXISHARP_APP_KEY") or self.config.get("app_key", "")
-        access_key = os.environ.get("LEXISHARP_ACCESS_KEY") or self.config.get("access_key", "")
+        channel = (config.get("channel") or "volcengine").strip().lower()
+        missing_messages: list[str] = []
 
-        if "在此填写" in app_key or not app_key.strip():
-            self._fatal_error("请在配置中填写火山引擎 APP ID（app_key）。")
-        if "在此填写" in access_key or not access_key.strip():
-            self._fatal_error("请在配置中填写火山引擎 Access Key（access_key）。")
+        if channel in {"volcengine", "volcano", "volc", "bytedance"}:
+            app_key = os.environ.get("LEXISHARP_APP_KEY") or config.get("app_key", "")
+            access_key = os.environ.get("LEXISHARP_ACCESS_KEY") or config.get("access_key", "")
+            has_app_key = bool(str(app_key).strip()) and "在此填写" not in str(app_key)
+            has_access_key = bool(str(access_key).strip()) and "在此填写" not in str(access_key)
+            if not (has_app_key or has_access_key):
+                missing_messages.append("至少填写火山引擎凭证（App ID 或 Access Key）。")
+        elif channel == "soniox":
+            api_key = os.environ.get("SONIOX_API_KEY") or config.get("soniox_api_key", "")
+            if "在此填写" in api_key or not str(api_key).strip():
+                missing_messages.append("Soniox API Key（soniox_api_key 或环境变量 SONIOX_API_KEY）")
+        else:
+            self.logger.info("检测到自定义渠道：%s，跳过配置校验。", channel)
 
-    def _fatal_error(self, message: str) -> None:
+        return missing_messages, channel
+
+    def _validate_keys(self, initial: bool = False, trigger_prompt: bool = True) -> bool:
         """
-        弹框提示严重错误并退出应用。
+        检查当前渠道所需配置是否完整。
         """
-        messagebox.showerror("LexiSharp-linux 配置错误", message)
-        self.root.destroy()
-        raise SystemExit(message)
+        self.logger.debug("开始校验配置。")
+        missing_messages, channel = self._collect_missing_fields(self.config)
+
+        if missing_messages:
+            self.config_ready = False
+            if hasattr(self, "record_button"):
+                self.record_button.configure(state=tk.DISABLED)
+            missing_text = "、".join(missing_messages)
+            self.logger.warning("配置缺失：%s", missing_text)
+            self.status_var.set("配置缺失，请点击右上角“设置”按钮完成必填项。")
+            if trigger_prompt and (initial or not self._config_prompt_shown):
+                messagebox.showwarning(
+                    "配置提醒",
+                    f"当前配置缺少以下内容：\n{missing_text}\n请在“设置”中完善后再使用。"
+                )
+                self._config_prompt_shown = True
+            if trigger_prompt:
+                self.root.after(0, self._open_settings)
+            return False
+
+        self.logger.info("配置校验通过，渠道：%s", channel)
+        self.config_ready = True
+        self._config_prompt_shown = False
+        if hasattr(self, "record_button"):
+            self.record_button.configure(state=tk.NORMAL)
+        if initial or self.status_var.get().startswith("配置缺失"):
+            self.status_var.set("准备就绪，点击开始录音。")
+        return True
 
     def toggle_recording(self) -> None:
         """
         开始或停止录音。
         """
         if self.processing:
+            return
+        if not self.config_ready:
+            messagebox.showwarning("配置提醒", "当前配置尚未完成，请先在设置中填写必需字段。")
+            self._open_settings()
             return
 
         if not self.recorder.is_running():
@@ -997,7 +1063,8 @@ class LexiSharpApp:
         file_size = Path(path).stat().st_size
         self.logger.info("音频文件大小：%d 字节", file_size)
         self.button_text.set("开始录音")
-        self.status_var.set("正在向火山引擎发送识别请求…")
+        provider_name = self._channel_display_name()
+        self.status_var.set(f"正在向 {provider_name} 发送识别请求…")
         self._schedule_floating_state("processing")
         self.processing = True
         threading.Thread(target=self._recognize_task, daemon=True).start()
@@ -1053,11 +1120,57 @@ class LexiSharpApp:
             self.processing = False
             self._schedule_floating_state("idle")
 
+    def _channel_display_name(self) -> str:
+        """
+        返回识别渠道的可读名称。
+        """
+        channel = (self.config.get("channel") or "volcengine").strip().lower()
+        if channel in {"volcengine", "volcano", "volc", "bytedance"}:
+            return "火山引擎"
+        if channel == "soniox":
+            return "Soniox"
+        return channel or "火山引擎"
+
+    def _open_settings(self) -> None:
+        """
+        打开设置对话框。
+        """
+        try:
+            if self.settings_dialog and self.settings_dialog.window.winfo_exists():
+                self.settings_dialog.window.lift()
+                self.settings_dialog.window.focus_force()
+                return
+        except Exception:
+            self.settings_dialog = None
+        try:
+            self.settings_dialog = SettingsDialog(self)
+        except Exception:
+            self.logger.exception("打开设置窗口失败")
+            messagebox.showerror("设置", "无法打开设置窗口，请查看日志。")
+
+    def _on_settings_closed(self) -> None:
+        """
+        设置窗口关闭时回调。
+        """
+        self.settings_dialog = None
+
     def _call_asr(self, audio_file: str) -> Optional[str]:
         """
-        调用火山引擎ASR接口并返回识别文本。
+        根据配置选择识别渠道并返回文本结果。
         """
-        self.logger.info("准备读取音频并发起 ASR 请求：%s", audio_file)
+        channel = (self.config.get("channel") or "volcengine").strip().lower()
+        self.logger.info("识别渠道：%s", channel or "volcengine")
+        if channel in {"volcengine", "volcano", "volc", "bytedance"}:
+            return self._call_volcengine(audio_file)
+        if channel == "soniox":
+            return self._call_soniox(audio_file)
+        raise RuntimeError(f"未识别的识别渠道：{channel}")
+
+    def _call_volcengine(self, audio_file: str) -> Optional[str]:
+        """
+        调用火山引擎极速版ASR接口。
+        """
+        self.logger.info("准备读取音频并发起火山引擎请求：%s", audio_file)
         with open(audio_file, "rb") as f:
             audio_data = base64.b64encode(f.read()).decode("utf-8")
 
@@ -1103,20 +1216,166 @@ class LexiSharpApp:
                 )
             raise RuntimeError(f"网络请求失败：{exc}，响应内容：{error_body}") from exc
         except requests.RequestException as exc:
-            self.logger.exception("ASR 请求发送失败")
+            self.logger.exception("火山引擎请求发送失败")
             raise RuntimeError(f"网络请求失败：{exc}") from exc
 
         status_code = response.headers.get("X-Api-Status-Code")
-        self.logger.info("ASR 返回状态码：%s，HTTP 状态：%s", status_code, response.status_code)
+        self.logger.info("火山引擎返回状态码：%s，HTTP 状态：%s", status_code, response.status_code)
         if status_code != "20000000":
             message = response.headers.get("X-Api-Message", "未知错误")
-            self.logger.error("ASR 接口返回异常：%s - %s", status_code, message)
+            self.logger.error("火山引擎接口返回异常：%s - %s", status_code, message)
             raise RuntimeError(f"ASR接口返回异常：{status_code} - {message}")
 
         data = response.json()
         text = data.get("result", {}).get("text", "")
-        self.logger.debug("ASR 原始数据：%s", data)
+        self.logger.debug("火山引擎原始数据：%s", data)
         return text.strip() or None
+
+    def _call_soniox(self, audio_file: str) -> Optional[str]:
+        """
+        调用 Soniox 异步识别接口。
+        """
+        api_key = os.environ.get("SONIOX_API_KEY") or self.config.get("soniox_api_key")
+        if not api_key or not str(api_key).strip():
+            raise RuntimeError("未配置 Soniox API Key，请在环境变量 SONIOX_API_KEY 或配置文件 soniox_api_key 中填写。")
+        base_url = (self.config.get("soniox_api_base") or CONFIG_TEMPLATE["soniox_api_base"]).rstrip("/")
+        model = (
+            os.environ.get("SONIOX_MODEL")
+            or self.config.get("soniox_model")
+            or CONFIG_TEMPLATE["soniox_model"]
+        )
+        poll_interval = max(0.5, float(self.config.get("soniox_poll_interval_s", CONFIG_TEMPLATE["soniox_poll_interval_s"])))
+        poll_timeout = max(poll_interval, float(self.config.get("soniox_poll_timeout_s", CONFIG_TEMPLATE["soniox_poll_timeout_s"])))
+        timeout = int(self.config.get("max_wait_s", 45))
+
+        request_id = os.environ.get("LEXISHARP_REQUEST_ID") or f"lexisharp-{uuid4()}"
+        self.logger.info("Soniox 请求 RequestId：%s", request_id)
+
+        session = requests.Session()
+        session.headers["Authorization"] = f"Bearer {api_key}"
+        session.headers["User-Agent"] = "LexiSharp-Soniox/1.0"
+
+        file_id = None
+        transcription_id = None
+        upload_url = f"{base_url}/v1/files"
+        transcription_url = f"{base_url}/v1/transcriptions"
+
+        try:
+            self.logger.info("开始上传音频至 Soniox：%s", audio_file)
+            with open(audio_file, "rb") as audio_fp:
+                response = session.post(upload_url, files={"file": audio_fp}, timeout=timeout)
+            response.raise_for_status()
+            file_id = response.json().get("id")
+            if not file_id:
+                raise RuntimeError("Soniox 文件上传响应缺少文件 ID。")
+            self.logger.info("Soniox 文件 ID：%s", file_id)
+
+            request_body = {
+                "model": model,
+                "file_id": file_id,
+                "client_reference_id": request_id
+            }
+            hints = self.config.get("soniox_language_hints")
+            if isinstance(hints, list):
+                normalized = [str(item).strip() for item in hints if str(item).strip()]
+                if normalized:
+                    request_body["language_hints"] = normalized
+            if bool(self.config.get("soniox_enable_speaker_diarization")):
+                request_body["enable_speaker_diarization"] = True
+            if bool(self.config.get("soniox_enable_language_identification")):
+                request_body["enable_language_identification"] = True
+            context_text = (self.config.get("soniox_context") or "").strip()
+            if context_text:
+                request_body["context"] = context_text
+
+            self.logger.info("创建 Soniox 转写任务...")
+            response = session.post(transcription_url, json=request_body, timeout=timeout)
+            response.raise_for_status()
+            transcription_id = response.json().get("id")
+            if not transcription_id:
+                raise RuntimeError("Soniox 转写创建响应缺少任务 ID。")
+            self.logger.info("Soniox 转写 ID：%s", transcription_id)
+
+            status_url = f"{transcription_url}/{transcription_id}"
+            transcript_url = f"{status_url}/transcript"
+
+            deadline = time.monotonic() + poll_timeout
+            last_status = ""
+            while True:
+                if time.monotonic() > deadline:
+                    raise RuntimeError("Soniox 识别超时，请检查音频或增大 soniox_poll_timeout_s。")
+                response = session.get(status_url, timeout=timeout)
+                response.raise_for_status()
+                status_payload = response.json()
+                status = (status_payload.get("status") or "").lower()
+                if status != last_status:
+                    self.logger.info("Soniox 任务状态：%s", status or "未知")
+                    last_status = status
+                if status == "completed":
+                    break
+                if status == "error":
+                    message = status_payload.get("error_message") or status_payload.get("message") or "未知错误"
+                    raise RuntimeError(f"Soniox 识别失败：{message}")
+                time.sleep(poll_interval)
+
+            self.logger.info("Soniox 转写完成，获取文本...")
+            response = session.get(transcript_url, timeout=timeout)
+            response.raise_for_status()
+            transcript_payload = response.json()
+            text = (transcript_payload.get("text") or "").strip()
+            if not text:
+                tokens = transcript_payload.get("tokens") or []
+                text = self._render_soniox_tokens(tokens).strip() if tokens else ""
+            if not text:
+                raise RuntimeError("Soniox API 未返回可用文本内容。")
+            return text
+        except requests.HTTPError as exc:
+            error_body = ""
+            if exc.response is not None:
+                error_body = exc.response.text
+            self.logger.error("Soniox HTTP 请求异常：%s，响应：%s", exc, error_body[:500])
+            raise RuntimeError(f"Soniox HTTP 请求失败：{exc}，响应内容：{error_body}") from exc
+        except requests.RequestException as exc:
+            self.logger.exception("Soniox 请求发送失败")
+            raise RuntimeError(f"Soniox 网络请求失败：{exc}") from exc
+        finally:
+            cleanup_timeout = min(timeout, 30)
+            if transcription_id:
+                try:
+                    session.delete(f"{transcription_url}/{transcription_id}", timeout=cleanup_timeout)
+                except Exception:
+                    self.logger.warning("Soniox 转写清理失败：%s", transcription_id)
+            if file_id:
+                try:
+                    session.delete(f"{base_url}/v1/files/{file_id}", timeout=cleanup_timeout)
+                except Exception:
+                    self.logger.warning("Soniox 文件清理失败：%s", file_id)
+            session.close()
+
+    def _render_soniox_tokens(self, tokens: List[dict]) -> str:
+        """
+        将 Soniox token 序列拼装成可读文本。
+        """
+        parts: List[str] = []
+        current_speaker: Optional[str] = None
+        current_language: Optional[str] = None
+        for token in tokens:
+            text = str(token.get("text") or "")
+            if not text:
+                continue
+            speaker = token.get("speaker")
+            language = token.get("language")
+            if speaker is not None and speaker != current_speaker:
+                if parts:
+                    parts.append("\n\n")
+                current_speaker = speaker
+                current_language = None
+                parts.append(f"说话人 {speaker}: ")
+            if language and language != current_language:
+                current_language = language
+                parts.append(f"[{language}] ")
+            parts.append(text)
+        return "".join(parts)
 
     def _auto_paste_async(self) -> bool:
         """
@@ -1465,15 +1724,405 @@ class LexiSharpApp:
         self.root.destroy()
 
 
+class SettingsDialog:
+    """
+    配置设置对话框，支持渠道切换与字段编辑。
+    """
+
+    CHANNEL_OPTIONS = [
+        ("volcengine", "火山引擎（Volcengine）"),
+        ("soniox", "Soniox"),
+    ]
+
+    CHANNEL_FIELDS: dict[str, list[dict[str, object]]] = {
+        "volcengine": [
+            {
+                "key": "app_key",
+                "label": "App ID",
+                "type": "entry",
+                "help": "必填：火山引擎控制台生成的 App ID。",
+            },
+            {
+                "key": "access_key",
+                "label": "Access Key",
+                "type": "entry",
+                "help": "必填：火山引擎控制台生成的 Access Key。",
+            },
+            {
+                "key": "resource_id",
+                "label": "Resource ID",
+                "type": "entry",
+                "help": "资源标识，若官方有更新可在此调整。",
+            },
+            {
+                "key": "api_url",
+                "label": "API 地址",
+                "type": "entry",
+                "help": "ASR 请求地址，通常保持默认即可。",
+            },
+            {
+                "key": "model_name",
+                "label": "模型名称",
+                "type": "entry",
+                "help": "模型标识，例如 bigmodel。",
+            },
+        ],
+        "soniox": [
+            {
+                "key": "soniox_api_key",
+                "label": "API Key",
+                "type": "entry",
+                "help": "必填：Soniox 控制台生成的 API Key。",
+            },
+            {
+                "key": "soniox_api_base",
+                "label": "API 基础地址",
+                "type": "entry",
+                "help": "默认 https://api.soniox.com，如需代理可在此调整。",
+            },
+            {
+                "key": "soniox_model",
+                "label": "模型（Model）",
+                "type": "entry",
+                "help": "例如 stt-async-preview，可参考官方文档。",
+            },
+            {
+                "key": "soniox_language_hints",
+                "label": "语言提示（逗号分隔）",
+                "type": "entry",
+                "list": True,
+                "help": "可选：例如 zh,en，有助于提升识别准确度。",
+            },
+            {
+                "key": "soniox_enable_speaker_diarization",
+                "label": "启用说话人分离",
+                "type": "boolean",
+            },
+            {
+                "key": "soniox_enable_language_identification",
+                "label": "启用语言识别",
+                "type": "boolean",
+            },
+            {
+                "key": "soniox_context",
+                "label": "上下文提示",
+                "type": "text",
+                "height": 5,
+                "help": "可选：输入行业词汇或短语，增强识别效果（≤10K 字符）。",
+            },
+            {
+                "key": "soniox_poll_interval_s",
+                "label": "轮询间隔（秒）",
+                "type": "entry",
+                "value_type": float,
+                "default": CONFIG_TEMPLATE["soniox_poll_interval_s"],
+            },
+            {
+                "key": "soniox_poll_timeout_s",
+                "label": "超时时间（秒）",
+                "type": "entry",
+                "value_type": float,
+                "default": CONFIG_TEMPLATE["soniox_poll_timeout_s"],
+            },
+        ],
+    }
+
+    def __init__(self, app: LexiSharpApp):
+        self.app = app
+        self.window = tk.Toplevel(app.root)
+        self.window.title("配置设置")
+        self.window.geometry("520x560")
+        self.window.minsize(520, 460)
+        self.window.resizable(False, False)
+        self.window.transient(app.root)
+        self.window.grab_set()
+        self.window.focus_force()
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
+
+        self.label_map = {key: label for key, label in self.CHANNEL_OPTIONS}
+        self.value_map = {label: key for key, label in self.CHANNEL_OPTIONS}
+
+        current_channel = (app.config.get("channel") or "volcengine").strip().lower()
+        if current_channel not in self.label_map:
+            current_channel = "volcengine"
+
+        top_frame = tk.Frame(self.window, padx=18, pady=16)
+        top_frame.pack(fill=tk.X)
+
+        channel_label = tk.Label(
+            top_frame,
+            text="识别渠道",
+            font=("WenQuanYi Micro Hei", 12, "bold")
+        )
+        channel_label.pack(anchor=tk.W)
+
+        self.channel_var = tk.StringVar(value=self.label_map[current_channel])
+        self.channel_combobox = ttk.Combobox(
+            top_frame,
+            textvariable=self.channel_var,
+            state="readonly",
+            values=[label for _, label in self.CHANNEL_OPTIONS],
+            width=28
+        )
+        self.channel_combobox.pack(anchor=tk.W, pady=(4, 10))
+        self.channel_combobox.bind("<<ComboboxSelected>>", self._on_channel_change)
+
+        ttk.Separator(self.window, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=18)
+
+        scroll_container = tk.Frame(self.window)
+        scroll_container.pack(fill=tk.BOTH, expand=True, padx=18, pady=(12, 0))
+
+        self.canvas = tk.Canvas(
+            scroll_container,
+            borderwidth=0,
+            highlightthickness=0,
+            width=0,
+            height=0
+        )
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        scrollbar = ttk.Scrollbar(scroll_container, orient=tk.VERTICAL, command=self.canvas.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+
+        self.channel_frame = tk.Frame(self.canvas)
+        self._canvas_window = self.canvas.create_window((0, 0), window=self.channel_frame, anchor="nw")
+        self.channel_frame.bind("<Configure>", lambda _event: self._update_scroll_region())
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind("<Button-4>", self._on_mousewheel)  # Linux scroll up
+        self.canvas.bind("<Button-5>", self._on_mousewheel)  # Linux scroll down
+
+        button_frame = tk.Frame(self.window, padx=18, pady=12)
+        button_frame.pack(fill=tk.X, pady=(0, 12))
+
+        save_button = tk.Button(
+            button_frame,
+            text="保存",
+            width=10,
+            command=self._save
+        )
+        save_button.pack(side=tk.RIGHT, padx=(6, 0))
+
+        cancel_button = tk.Button(
+            button_frame,
+            text="取消",
+            width=10,
+            command=self.close
+        )
+        cancel_button.pack(side=tk.RIGHT)
+
+        self.field_widgets: dict[str, dict[str, object]] = {}
+
+        try:
+            self.app._register_window(self.window)
+        except Exception:
+            self.app.logger.exception("注册设置窗口失败")
+
+        self._render_channel_fields(current_channel)
+
+    def _on_channel_change(self, _event=None) -> None:
+        channel_key = self._get_selected_channel_key()
+        self._render_channel_fields(channel_key)
+
+    def _get_selected_channel_key(self) -> str:
+        label = self.channel_var.get()
+        return self.value_map.get(label, "volcengine")
+
+    def _render_channel_fields(self, channel: str) -> None:
+        for child in self.channel_frame.winfo_children():
+            child.destroy()
+        self.field_widgets.clear()
+
+        fields = self.CHANNEL_FIELDS.get(channel, [])
+        if not fields:
+            empty_label = tk.Label(
+                self.channel_frame,
+                text="当前渠道暂无可配置项。",
+                font=("WenQuanYi Micro Hei", 11),
+                fg="#666666"
+            )
+            empty_label.pack(anchor=tk.W)
+            return
+
+        for field in fields:
+            label = tk.Label(
+                self.channel_frame,
+                text=field["label"],
+                font=("WenQuanYi Micro Hei", 12)
+            )
+            label.pack(anchor=tk.W, pady=(0, 2))
+
+            key = field["key"]  # type: ignore[index]
+            current_value = self._get_config_value(key, field)
+            entry_type = field.get("type")
+
+            if entry_type == "entry":
+                entry = tk.Entry(self.channel_frame, width=38)
+                if isinstance(current_value, list):
+                    entry.insert(0, ", ".join(current_value))
+                elif current_value not in (None, ""):
+                    entry.insert(0, str(current_value))
+                entry.pack(anchor=tk.W, pady=(0, 6))
+                self.field_widgets[key] = {"widget": entry, "field": field}
+            elif entry_type == "boolean":
+                var = tk.BooleanVar(value=bool(current_value))
+                checkbox = tk.Checkbutton(
+                    self.channel_frame,
+                    text="启用",
+                    variable=var,
+                    font=("WenQuanYi Micro Hei", 11)
+                )
+                checkbox.pack(anchor=tk.W, pady=(0, 6))
+                self.field_widgets[key] = {"widget": checkbox, "variable": var, "field": field}
+            elif entry_type == "text":
+                height = field.get("height", 4)
+                text_widget = tk.Text(self.channel_frame, width=42, height=int(height))
+                text_widget.insert("1.0", str(current_value or ""))
+                text_widget.pack(anchor=tk.W, pady=(0, 6))
+                self.field_widgets[key] = {"widget": text_widget, "field": field}
+            else:
+                placeholder = tk.Label(
+                    self.channel_frame,
+                    text="暂不支持的字段类型",
+                    fg="red"
+                )
+                placeholder.pack(anchor=tk.W, pady=(0, 6))
+                continue
+
+            help_text = field.get("help")
+            if help_text:
+                help_label = tk.Label(
+                    self.channel_frame,
+                    text=str(help_text),
+                    font=("WenQuanYi Micro Hei", 10),
+                    fg="#666666",
+                    wraplength=360,
+                    justify=tk.LEFT
+                )
+                help_label.pack(anchor=tk.W, pady=(0, 8))
+
+        self._update_scroll_region()
+
+    def _get_config_value(self, key: str, field: dict[str, object]):
+        if key in self.app.config:
+            value = self.app.config[key]
+            if field.get("list"):
+                if isinstance(value, list):
+                    return value
+                if isinstance(value, str):
+                    return [item.strip() for item in value.split(",") if item.strip()]
+            return value
+        return field.get("default", CONFIG_TEMPLATE.get(key))
+
+    def _save(self) -> None:
+        channel_key = self._get_selected_channel_key()
+        updates: dict[str, object] = {"channel": channel_key}
+        fields = self.CHANNEL_FIELDS.get(channel_key, [])
+
+        for field in fields:
+            key = field["key"]  # type: ignore[index]
+            stored = self.field_widgets.get(key)
+            if not stored:
+                continue
+            widget = stored.get("widget")
+            entry_type = field.get("type")
+
+            if entry_type == "entry":
+                value_str = widget.get().strip() if isinstance(widget, tk.Entry) else ""
+                if field.get("list"):
+                    value = [item.strip() for item in value_str.split(",") if item.strip()]
+                elif field.get("value_type") is float:
+                    if not value_str:
+                        value_str = str(field.get("default", CONFIG_TEMPLATE.get(key, 0.0)))
+                    try:
+                        value = float(value_str)
+                    except ValueError:
+                        messagebox.showerror("设置", f"{field['label']} 需要填写数字。")  # type: ignore[index]
+                        if isinstance(widget, tk.Entry):
+                            widget.focus_set()
+                        return
+                else:
+                    value = value_str
+                updates[key] = value
+            elif entry_type == "boolean":
+                var = stored.get("variable")
+                if isinstance(var, tk.BooleanVar):
+                    updates[key] = bool(var.get())
+            elif entry_type == "text":
+                if isinstance(widget, tk.Text):
+                    updates[key] = widget.get("1.0", tk.END).strip()
+
+        candidate_config = dict(self.app.config)
+        candidate_config.update(updates)
+        missing_messages, _ = self.app._collect_missing_fields(candidate_config)
+        if missing_messages:
+            detail = "、".join(missing_messages)
+            messagebox.showwarning("设置", f"保存失败：以下字段仍需填写：{detail}。")
+            return
+
+        try:
+            self.app.config.update(updates)
+            if not self.app._validate_keys(trigger_prompt=False):
+                messagebox.showwarning("设置", "仍有必填项缺失，请继续完善。")
+                return
+            save_config(self.app.config)
+            self.app.logger.info("配置已通过设置窗口更新：%s", updates.keys())
+            provider_name = self.app._channel_display_name()
+            self.app.status_var.set(f"配置已保存，当前识别渠道：{provider_name}。")
+            messagebox.showinfo("设置", "配置已保存。")
+            self.close()
+        except Exception as exc:
+            self.app.logger.exception("保存配置失败")
+            messagebox.showerror("设置", f"保存失败：{exc}")
+
+    def close(self) -> None:
+        try:
+            self.window.grab_release()
+        except Exception:
+            pass
+        try:
+            self.app._unregister_window(self.window)
+        except Exception:
+            pass
+        if self.window.winfo_exists():
+            self.window.destroy()
+        self.app._on_settings_closed()
+
+    def _on_canvas_configure(self, event: tk.Event) -> None:  # type: ignore[type-arg]
+        try:
+            self.canvas.itemconfigure(self._canvas_window, width=event.width)
+        except Exception:
+            pass
+        self._update_scroll_region()
+
+    def _update_scroll_region(self) -> None:
+        try:
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _on_mousewheel(self, event: tk.Event) -> None:  # type: ignore[type-arg]
+        try:
+            delta = 0
+            if hasattr(event, "delta") and event.delta:
+                delta = -1 if event.delta > 0 else 1
+            else:
+                if getattr(event, "num", None) == 4:
+                    delta = -1
+                elif getattr(event, "num", None) == 5:
+                    delta = 1
+            if delta:
+                self.canvas.yview_scroll(delta, "units")
+        except Exception:
+            pass
+
+
 def main() -> None:
     """
     应用入口。
     """
-    try:
-        config = ensure_config()
-    except RuntimeError as exc:
-        print(exc)
-        return
+    config = ensure_config()
     logger = setup_logging(config.get("log_level", "INFO"))
     logger.info("LexiSharp-linux 启动，配置路径：%s", CONFIG_PATH)
 
