@@ -4,6 +4,7 @@
 LexiSharp-linux 主程序：通过录音 + 多种云端 ASR（火山引擎、Soniox 等）实现一键语音输入。
 """
 
+import asyncio
 import audioop
 import base64
 import json
@@ -16,6 +17,7 @@ import tempfile
 import threading
 import time
 import wave
+from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from http import HTTPStatus
@@ -39,6 +41,18 @@ try:
     import dashscope  # type: ignore[import]
 except ImportError:  # pragma: no cover - 处理运行时缺失
     dashscope = None
+
+try:
+    from dbus_next import BusType, Message
+    from dbus_next.constants import MessageType
+    from dbus_next.errors import DBusError
+    from dbus_next.aio import MessageBus
+except ImportError:  # pragma: no cover - 处理运行时缺失
+    BusType = None
+    Message = None
+    MessageBus = None
+    MessageType = None
+    DBusError = Exception
 
 # 配置文件路径
 CONFIG_DIR = Path.home() / ".lexisharp-linux"
@@ -71,6 +85,9 @@ CONFIG_TEMPLATE = {
     "qwen_enable_lid": True,
     "qwen_enable_itn": False,
     "auto_paste": True,
+    "input_method": "dbus",
+    "dbus_fallback_to_clipboard": True,
+    "dbus_timeout_ms": 300,
     "paste_delay_ms": 200,
     "max_wait_s": 45,
     "log_level": "INFO",
@@ -316,6 +333,211 @@ class ClipboardHelper:
             return text
 
 
+@dataclass
+class AutoPasteResult:
+    success: bool
+    clipboard_synced: bool
+    method: str
+    status_message: Optional[str] = None
+
+
+class FcitxDbusInput:
+    """通过 Fcitx DBus 接口提交文本，避免修改剪贴板。"""
+
+    SERVICE_CANDIDATES = (
+        (
+            "org.fcitx.Fcitx5",
+            (
+                ("/org/freedesktop/portal/inputmethod", "org.fcitx.Fcitx.InputMethod1"),
+                ("/inputmethod", "org.fcitx.Fcitx.InputMethod1"),
+            ),
+        ),
+        (
+            "org.fcitx.Fcitx",
+            (("/inputmethod", "org.fcitx.Fcitx.InputMethod"),),
+        ),
+    )
+    INPUT_CONTEXT_INTERFACES = (
+        "org.fcitx.Fcitx.InputContext1",
+        "org.fcitx.Fcitx.InputContext",
+    )
+
+    def __init__(
+        self,
+        logger: Optional[logging.Logger] = None,
+        timeout_ms: int = 300,
+        app_name: str = "LexiSharp-linux"
+    ) -> None:
+        parent_logger = logger or logging.getLogger("lexisharp")
+        self.logger = parent_logger.getChild("dbus")
+        self.timeout_ms = max(100, int(timeout_ms))
+        self.app_name = app_name
+        self._lock = threading.Lock()
+
+    @property
+    def _timeout(self) -> float:
+        return max(0.1, self.timeout_ms / 1000.0)
+
+    def is_supported(self) -> bool:
+        return all(obj is not None for obj in (MessageBus, BusType, Message, MessageType))
+
+    def send(self, text: str) -> bool:
+        if not self.is_supported():
+            self.logger.debug("dbus-next 未安装，跳过 DBus 输入。")
+            return False
+        payload = text or ""
+        if not payload:
+            self.logger.debug("待提交文本为空，忽略 DBus 调用。")
+            return True
+        with self._lock:
+            try:
+                return self._run_async(self._send_once(payload))
+            except Exception:  # pragma: no cover
+                self.logger.exception("DBus 输入流程出现异常")
+                return False
+
+    def close(self) -> None:
+        # 对于异步实现，无需额外资源释放。
+        return None
+
+    def _run_async(self, coro: "asyncio.Future[bool]") -> bool:
+        try:
+            return asyncio.run(coro)
+        except RuntimeError as exc:
+            if "asyncio.run() cannot be called from a running event loop" in str(exc):
+                loop = asyncio.new_event_loop()
+                try:
+                    asyncio.set_event_loop(loop)
+                    return loop.run_until_complete(coro)
+                finally:
+                    asyncio.set_event_loop(None)
+                    loop.close()
+            raise
+
+    async def _send_once(self, text: str) -> bool:
+        bus: Optional[MessageBus] = None
+        try:
+            bus = MessageBus(bus_type=BusType.SESSION)
+            await bus.connect()
+        except Exception as exc:
+            self.logger.warning("连接 Session Bus 失败：%s", exc)
+            return False
+
+        try:
+            for service, entries in self.SERVICE_CANDIDATES:
+                if not await self._has_owner(bus, service):
+                    continue
+                for path, iface_name in entries:
+                    success = await self._try_service_entry(bus, service, path, iface_name, text)
+                    if success:
+                        return True
+            self.logger.warning("未检测到可用的 Fcitx DBus 接口。")
+            return False
+        finally:
+            try:
+                bus.disconnect()
+            except Exception:
+                self.logger.debug("关闭 DBus 连接失败", exc_info=True)
+
+    async def _has_owner(self, bus: MessageBus, service: str) -> bool:
+        message = Message(
+            destination="org.freedesktop.DBus",
+            path="/org/freedesktop/DBus",
+            interface="org.freedesktop.DBus",
+            member="NameHasOwner",
+            signature="s",
+            body=[service]
+        )
+        try:
+            reply = await bus.call(message)
+        except Exception as exc:
+            self.logger.debug("查询 %s 的 DBus 拥有者失败：%s", service, exc)
+            return False
+        if not reply or reply.message_type != MessageType.METHOD_RETURN:
+            return False
+        return bool(reply.body and reply.body[0])
+
+    async def _try_service_entry(
+        self,
+        bus: MessageBus,
+        service: str,
+        path: str,
+        iface_name: str,
+        text: str
+    ) -> bool:
+        try:
+            introspection = await bus.introspect(service, path)
+        except Exception as exc:
+            self.logger.debug("读取 %s %s 自省信息失败：%s", service, path, exc)
+            return False
+
+        proxy = bus.get_proxy_object(service, path, introspection)
+        try:
+            input_method_iface = proxy.get_interface(iface_name)
+        except KeyError:
+            self.logger.debug("接口 %s 未在路径 %s 上暴露", iface_name, path)
+            return False
+
+        args = self._build_context_args()
+        try:
+            context_path, _ = await input_method_iface.call_CreateInputContext(args)
+        except DBusError as exc:
+            self.logger.debug("CreateInputContext 调用失败：%s", exc)
+            return False
+        except Exception as exc:
+            self.logger.debug("CreateInputContext 未知异常：%s", exc)
+            return False
+
+        try:
+            ctx_introspection = await bus.introspect(service, context_path)
+        except Exception as exc:
+            self.logger.debug("获取上下文 %s 自省失败：%s", context_path, exc)
+            return False
+
+        proxy_ctx = bus.get_proxy_object(service, context_path, ctx_introspection)
+        context_iface = None
+        for candidate in self.INPUT_CONTEXT_INTERFACES:
+            if candidate in ctx_introspection.interfaces:
+                try:
+                    context_iface = proxy_ctx.get_interface(candidate)
+                    break
+                except KeyError:
+                    continue
+
+        if context_iface is None:
+            self.logger.debug("输入上下文 %s 不包含支持的接口", context_path)
+            return False
+
+        try:
+            await context_iface.call_FocusIn()
+            await context_iface.call_CommitString(text)
+            try:
+                await context_iface.call_FocusOut()
+            except Exception:
+                self.logger.debug("FocusOut 调用失败，忽略。", exc_info=True)
+            self.logger.info("通过 DBus 成功提交文本，长度=%d", len(text))
+            return True
+        except DBusError as exc:
+            self.logger.warning("DBus 提交文本失败：%s", exc)
+            return False
+        except Exception as exc:
+            self.logger.exception("DBus 输入时出现异常")
+            return False
+        finally:
+            if context_iface is not None:
+                try:
+                    await context_iface.call_DestroyIC()
+                except Exception:
+                    self.logger.debug("DestroyIC 调用失败，忽略。", exc_info=True)
+
+    def _build_context_args(self) -> list[tuple[str, str]]:
+        display = os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY") or ""
+        return [
+            ("program", self.app_name),
+            ("display", display),
+            ("clientControlVirtualkeyboardShow", "true"),
+            ("clientControlVirtualkeyboardHide", "true"),
+        ]
 class InputInjector:
     """
     在不同图形栈下注入键盘事件，Wayland 环境优先使用 uinput。
@@ -780,6 +1002,8 @@ class LexiSharpApp:
         self.logger = logger
         self.clipboard = ClipboardHelper(logger=self.logger)
         self.input_injector = InputInjector(logger=self.logger)
+        dbus_timeout = int(self.config.get("dbus_timeout_ms", CONFIG_TEMPLATE["dbus_timeout_ms"]))
+        self.dbus_input = FcitxDbusInput(logger=self.logger, timeout_ms=dbus_timeout)
         self.start_hotkey = (self.config.get("start_hotkey") or "").strip()
         self.stop_hotkey = (self.config.get("stop_hotkey") or "").strip()
         self.hotkey_manager: Optional[GlobalHotkeyManager] = None
@@ -1101,25 +1325,63 @@ class LexiSharpApp:
             self._refresh_result(text)
 
             copy_success_message = "识别完成，内容已复制到剪贴板。"
-            auto_paste_message = "识别完成，内容已复制到剪贴板，并自动粘贴到目标窗口。"
+            auto_paste_clipboard_message = "识别完成，内容已复制到剪贴板，并自动粘贴到目标窗口。"
+            auto_paste_dbus_message = "识别完成，已通过输入法自动提交到目标窗口，剪贴板保持原样。"
             copy_message = copy_success_message
-            copied = self.clipboard.copy(text)
-            if not copied:
-                copy_message = (
-                    "识别成功，但无法复制到剪贴板，请安装 wl-clipboard（Wayland）或 xclip/xsel（X11）。"
+
+            auto_paste_enabled = bool(self.config.get("auto_paste", False))
+            autopaste_result: Optional[AutoPasteResult] = None
+            pasted = False
+            clipboard_synced = False
+            copy_needed = True
+
+            if auto_paste_enabled:
+                autopaste_result = self._auto_paste_async()
+                pasted = autopaste_result.success
+                clipboard_synced = autopaste_result.clipboard_synced
+                if pasted and autopaste_result.method == "dbus":
+                    copy_needed = False
+                else:
+                    copy_needed = not clipboard_synced
+
+            copied = True
+            if copy_needed:
+                copied = self.clipboard.copy(text)
+                if not copied:
+                    copy_message = (
+                        "识别成功，但无法复制到剪贴板，请安装 wl-clipboard（Wayland）或 xclip/xsel（X11）。"
+                    )
+
+            final_status: Optional[str] = None
+            if auto_paste_enabled:
+                if pasted:
+                    if autopaste_result and autopaste_result.method == "dbus":
+                        final_status = auto_paste_dbus_message
+                    else:
+                        final_status = auto_paste_clipboard_message
+                    if autopaste_result and autopaste_result.status_message:
+                        final_status += f"（{autopaste_result.status_message}）"
+                else:
+                    if autopaste_result and autopaste_result.status_message:
+                        final_status = autopaste_result.status_message
+                    else:
+                        final_status = (
+                            "识别完成，内容已复制到剪贴板，请手动粘贴。"
+                            if copied
+                            else copy_message
+                        )
+            else:
+                final_status = (
+                    "识别完成，内容已复制到剪贴板，请手动粘贴。"
+                    if copied
+                    else copy_message
                 )
 
-            if copied:
-                if self.config.get("auto_paste", False):
-                    pasted = self._auto_paste_async()
-                    if pasted:
-                        self._update_status(auto_paste_message)
-                    else:
-                        self._update_status("识别完成，内容已复制到剪贴板，请手动粘贴。")
-                else:
-                    self._update_status("识别完成，内容已复制到剪贴板，请手动粘贴。")
-            else:
-                self._update_status(copy_message)
+            if not copied:
+                final_status = copy_message
+
+            if final_status:
+                self._update_status(final_status)
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.exception("识别流程发生异常")
             self._update_status(f"识别失败：{exc}")
@@ -1518,36 +1780,66 @@ class LexiSharpApp:
 
         return text
 
-    def _auto_paste_async(self) -> bool:
-        """
-        自动激活目标窗口并触发粘贴。
+    def _auto_paste_async(self) -> AutoPasteResult:
+        """自动输入识别结果，优先尝试 DBus，再回退至原有方案。"""
+        text = self.last_result_text or self.clipboard.paste()
+        if not text:
+            message = "自动粘贴失败：暂未获取到可写入的文本。"
+            self.logger.warning(message)
+            return AutoPasteResult(False, False, "none", message)
 
-        返回：
-            bool: True 表示成功触发自动粘贴，False 表示失败或已回退。
-        """
+        preferred_method = str(self.config.get("input_method", "clipboard")).strip().lower()
+        allow_clipboard_fallback = bool(self.config.get("dbus_fallback_to_clipboard", True))
+        paste_wait_ms = max(0, int(self.config.get("paste_delay_ms", 200)))
+        clipboard_synced = False
+        status_message: Optional[str] = None
+
+        if preferred_method == "dbus":
+            if self.dbus_input and self.dbus_input.is_supported():
+                if self.dbus_input.send(text):
+                    return AutoPasteResult(True, False, "dbus")
+                self.logger.warning("DBus 输入失败，将尝试传统方式。")
+            else:
+                self.logger.warning("DBus 输入配置启用，但依赖缺失或初始化失败。")
+            if not allow_clipboard_fallback:
+                message = "DBus 输入失败，已保留剪贴板内容，请手动粘贴。"
+                return AutoPasteResult(False, False, "dbus", message)
+            clipboard_synced = self.clipboard.copy(text)
+            if not clipboard_synced:
+                status_message = (
+                    "回退时复制到剪贴板失败，后续快捷键粘贴可能不可用。"
+                )
+        else:
+            clipboard_synced = self.clipboard.copy(text)
+            if not clipboard_synced:
+                status_message = (
+                    "识别成功，但无法复制到剪贴板，请安装 wl-clipboard（Wayland）或 xclip/xsel（X11）。"
+                )
+
+        self.logger.info(
+            "自动粘贴文本长度=%d，clipboard_synced=%s", len(text), clipboard_synced
+        )
+
+        if self.input_injector and clipboard_synced and self.input_injector.can_use_uinput():
+            self.logger.info("尝试通过 uinput 注入 Ctrl+V，等待 %d ms。", paste_wait_ms)
+            if self.input_injector.inject_ctrl_v(wait_ms=paste_wait_ms):
+                self.logger.info("uinput 自动粘贴流程完成。")
+                return AutoPasteResult(True, True, "uinput", status_message)
+            self.logger.warning("uinput 自动粘贴失败，将回退至 xdotool。")
+
+        if not self.target_window:
+            message = "缺少目标窗口，已复制文本，请手动粘贴。"
+            self.logger.warning(message)
+            return AutoPasteResult(False, clipboard_synced, "none", message)
+
+        delay_ms = max(1, int(self.config.get("type_delay_ms", 5)))
+        self.logger.info(
+            "准备向窗口 %s (%s) 模拟键入，字符数=%d",
+            self.target_window,
+            self._window_name(self.target_window),
+            len(text)
+        )
         try:
-            text_source = "缓存结果" if self.last_result_text else "剪贴板"
-            text = self.last_result_text or self.clipboard.paste()
-            if not text:
-                raise subprocess.CalledProcessError(returncode=1, cmd="xdotool type --window ...")
-
-            self.logger.info("自动粘贴文本来源：%s，字符数=%d", text_source, len(text))
-            paste_wait_ms = max(0, int(self.config.get("paste_delay_ms", 200)))
-            if self.input_injector and self.input_injector.can_use_uinput():
-                self.logger.info("尝试通过 uinput 注入 Ctrl+V，等待 %d ms。", paste_wait_ms)
-                if self.input_injector.inject_ctrl_v(wait_ms=paste_wait_ms):
-                    self.logger.info("uinput 自动粘贴流程完成。")
-                    return True
-                self.logger.warning("uinput 自动粘贴失败，将回退至 xdotool。")
-
-            if not self.target_window:
-                self.logger.warning("无法自动粘贴：缺少目标窗口")
-                self._update_status("缺少目标窗口，已复制文本，请手动粘贴。")
-                return False
-
-            delay_ms = max(1, int(self.config.get("type_delay_ms", 5)))
-            self.logger.info("准备向窗口 %s (%s) 模拟键入，字符数=%d",
-                             self.target_window, self._window_name(self.target_window), len(text))
             result = subprocess.run(
                 [
                     "xdotool",
@@ -1563,23 +1855,22 @@ class LexiSharpApp:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
-            if result.returncode == 0:
-                self.logger.info("已向窗口 %s 模拟键入文本", self.target_window)
-                return True
-
-            raise subprocess.CalledProcessError(returncode=result.returncode, cmd="xdotool type")
         except FileNotFoundError:
-            self.logger.exception("自动粘贴失败：未找到 xdotool")
-            self._update_status("未找到 xdotool，无法自动粘贴，请手动处理。")
-            return False
-        except subprocess.CalledProcessError as exc:
-            self.logger.exception("自动粘贴执行失败")
-            self._update_status(f"自动粘贴失败：{exc}")
-            return False
-        except Exception:
-            self.logger.exception("自动粘贴流程出现未知异常")
-            self._update_status("自动粘贴失败，已复制文本，请手动粘贴。")
-            return False
+            message = "未找到 xdotool，无法模拟键入，请手动粘贴。"
+            self.logger.exception(message)
+            return AutoPasteResult(False, clipboard_synced, "none", message)
+        except Exception as exc:  # pragma: no cover
+            message = f"自动粘贴流程出现未知异常：{exc}"
+            self.logger.exception(message)
+            return AutoPasteResult(False, clipboard_synced, "none", message)
+
+        if result.returncode == 0:
+            self.logger.info("已向窗口 %s 模拟键入文本", self.target_window)
+            return AutoPasteResult(True, clipboard_synced, "xdotool", status_message)
+
+        message = "自动粘贴失败：xdotool type 返回非零状态。"
+        self.logger.error(message)
+        return AutoPasteResult(False, clipboard_synced, "xdotool", message)
 
     def _refresh_result(self, text: str) -> None:
         """

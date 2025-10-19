@@ -3,3 +3,4 @@ dashscope>=1.24.6
 pyperclip>=1.8.2
 pynput>=1.7.6
 evdev>=1.6.1
+dbus-next>=0.2.3

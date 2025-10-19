@@ -13,7 +13,7 @@ LexiSharp-linux 是一款运行于 Linux 桌面的轻量级语音输入工具，
 ## 功能概览
 - **一键录音**：主界面仅保留“开始/停止录音”按钮，同时可选启用悬浮按钮（置顶、可拖拽）。
 - **极速转写**：集成火山引擎大模型录音文件极速版识别 API，并可选择 Soniox 等渠道。
-- **结果自动复制/粘贴**：识别文本会自动写入剪贴板；启用自动粘贴后会模拟 `Ctrl+V` 将内容送入目标窗口（默认关闭，Wayland 下需要安装 `wl-clipboard`）。
+- **自动输入**：默认通过 Fcitx DBus 接口将识别结果直接提交至当前输入环境，避免覆盖剪贴板；当 DBus 不可用时自动使用剪贴板 进行输入。（Wayland 下推荐安装 `wl-clipboard`）。
 - **配置简明**：首次启动生成 `~/.lexisharp-linux/config.json` 模板，填入密钥即可使用。
 
 #  通过程序启动
@@ -158,6 +158,29 @@ pip install -r requirements.txt
    - `qwen_enable_itn`：开启后通义千问会对数字、金额等文本做逆文本规范化（目前支持中英文）。
 4. 通义千问要求音频格式为 16kHz 单声道，且单次调用不超过 10MB / 3 分钟。程序默认录音参数已满足要求，如遇超长录音可在界面中手动停止或拆分上传。
 5. 更多参数说明与最佳实践，可参考官方文档《录音文件识别-通义千问》：https://help.aliyun.com/zh/model-studio/qwen-speech-recognition
+
+## 输入方式选择
+
+LexiSharp 默认优先使用 Fcitx DBus 接口直接提交文本，并在失败时自动回退到传统的剪贴板 兼容模式。若需要强制切换，可在 `~/.lexisharp-linux/config.json` 中调整以下配置：
+
+```json
+{
+  "input_method": "dbus",
+  "dbus_fallback_to_clipboard": true,
+  "dbus_timeout_ms": 300
+}
+```
+
+- `input_method`：`dbus`（默认）或 `clipboard`。当设为 `dbus` 时，程序会通过 Fcitx DBus 接口调用 `CommitString` 将文本直接提交到当前输入上下文；设置为 `clipboard` 可回退到纯剪贴板流程。
+- `dbus_fallback_to_clipboard`：若 DBus 调用失败，是否自动回退到原有剪贴板方式；设为 `false` 时，失败后仅保留识别结果，剪贴板不做改动。
+- `dbus_timeout_ms`：DBus 调用超时时间，单位毫秒，可视需要适当增大。
+
+启用 DBus 模式的前提条件：
+
+1. 桌面环境正在运行 Fcitx（推荐 Fcitx5），并已启用 DBus 前端。
+2. Python 环境安装了 `dbus-next`（已包含在项目 `requirements.txt` 中）。
+
+当 DBus 调用成功时，状态栏会提示“已通过输入法自动提交到目标窗口，剪贴板保持原样”；如遇失败并允许回退，程序会自动复制文本并继续使用原有注入流程。
 
 ## 使用步骤
 
