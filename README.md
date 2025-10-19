@@ -39,16 +39,17 @@ Fedora/RHEL：
 sudo dnf install python3 python3-pip python3-virtualenv alsa-utils xdotool xclip python3-tkinter
 ```
 
-### 2. 虚拟环境（推荐）
+虚拟环境（推荐）
 ```bash
 python -m venv ~/.venvs/lexisharp
 source ~/.venvs/lexisharp/bin/activate
 ```
 
-### 3. Python 依赖
+Python 依赖
 ```bash
 pip install -r requirements.txt
 ```
+
 
 ## 火山引擎配置
 1. 在火山引擎控制台开启 **大模型录音文件极速版识别** 能力，获取：
