@@ -119,8 +119,8 @@ def setup_logging(log_level: str = "INFO") -> logging.Logger:
 
     handler = RotatingFileHandler(
         LOG_PATH,
-        maxBytes=2 * 1024 * 1024,
-        backupCount=3,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=1,
         encoding="utf-8"
     )
     formatter = logging.Formatter(

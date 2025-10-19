@@ -53,7 +53,7 @@ Python 依赖
 pip install -r requirements.txt
 ```
 
-> 若在 Wayland 环境启用 `auto_paste`，请确保已安装 `wl-clipboard`（Arch使用 `paru -S wl-clipboard`安装），并将当前用户加入 `input` 组（或放开 `/dev/uinput` 权限）。程序会通过 `python-evdev`（已在 `requirements.txt` 中）创建虚拟键盘自动发送 `Ctrl+V`。 
+> 若在 Wayland 环境启用 `auto_paste`，请确保已安装 `wl-clipboard`（Arch使用 `paru -S wl-clipboard`安装））。程序会通过 `python-evdev`（已在 `requirements.txt` 中）创建虚拟键盘自动发送 `Ctrl+V`。 
 
 
 ## 火山引擎配置
@@ -109,7 +109,7 @@ arch可直接通过alt+空格键输入lexisharp.sh运行
 4. 识别结果会自动复制到剪贴板，并尝试自动粘贴到目标窗口；若未成功，可手动使用 `Ctrl+V` 粘贴。
 5. 可在界面勾选“显示浮动录音按钮”，获得置顶的悬浮录音键。
 
-> 提示：`auto_paste` 默认关闭。满足依赖条件后可将其设为 `true`，程序会在复制成功后自动向目标窗口注入内容；若遇到兼容性问题，可随时关闭并手动粘贴。
+> 提示：`auto_paste` 默认开启。，程序会在复制成功后自动向目标窗口注入内容；若遇到兼容性问题，可随时关闭并手动粘贴。
 
 ## 常见问题
 - **提示未找到 arecord**：确认已安装 `alsa-utils`，终端执行 `arecord -h` 验证。
@@ -125,7 +125,7 @@ arch可直接通过alt+空格键输入lexisharp.sh运行
     Subdevice #0: subdevice #0
   ```
   对应在配置中设置 `"arecord_device"` 为 `plughw:1,0`。
-
+- **日志文件**：程序日志保存在.lexisharp-linux/目录下，遇到问题可以先检查log文件
 ## 即将实现：
 - 支持更多第三方 ASR 服务或本地模型。
 - 改进 UI 体验与配置流程。
