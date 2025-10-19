@@ -3,6 +3,9 @@
 LexiSharp-linux 是一款运行于 Linux 桌面的轻量级语音输入工具，围绕“录音 → 识别 → 粘贴”这一流程展开，实现最小成本的语音转文字体验。
 项目灵感来源于安卓版LexiSharp。安卓版版本已经是一个非常完善且功能强大的版本！地址：https://github.com/BryceWG/LexiSharp-Keyboard
 
+
+### 目前项目处于初级开发阶段，暂不提供执行程序.可以通过一键脚本或手动启动方式使用
+
 <img width="479" height="547" alt="image" src="https://github.com/user-attachments/assets/26d7d875-26da-4004-8270-305192cf16f3" />
 
 
