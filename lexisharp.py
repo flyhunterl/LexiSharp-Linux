@@ -18,6 +18,7 @@ import time
 import wave
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from http import HTTPStatus
 from typing import List, Optional
 from uuid import uuid4
 
@@ -33,6 +34,11 @@ try:
 except ImportError:  # pragma: no cover - 处理运行时缺失
     UInput = None
     ecodes = None
+
+try:
+    import dashscope  # type: ignore[import]
+except ImportError:  # pragma: no cover - 处理运行时缺失
+    dashscope = None
 
 # 配置文件路径
 CONFIG_DIR = Path.home() / ".lexisharp-linux"
@@ -58,6 +64,12 @@ CONFIG_TEMPLATE = {
     "soniox_context": "",
     "soniox_poll_interval_s": 1.0,
     "soniox_poll_timeout_s": 120.0,
+    "qwen_api_key": "在此填写DashScope API Key",
+    "qwen_model": "qwen3-asr-flash",
+    "qwen_context": "",
+    "qwen_language": "",
+    "qwen_enable_lid": True,
+    "qwen_enable_itn": False,
     "auto_paste": True,
     "paste_delay_ms": 200,
     "max_wait_s": 45,
@@ -973,6 +985,10 @@ class LexiSharpApp:
             api_key = os.environ.get("SONIOX_API_KEY") or config.get("soniox_api_key", "")
             if "在此填写" in api_key or not str(api_key).strip():
                 missing_messages.append("Soniox API Key（soniox_api_key 或环境变量 SONIOX_API_KEY）")
+        elif channel in {"qwen", "tongyi", "tongyiqianwen", "dashscope"}:
+            api_key = os.environ.get("DASHSCOPE_API_KEY") or config.get("qwen_api_key", "")
+            if "在此填写" in str(api_key) or not str(api_key).strip():
+                missing_messages.append("通义千问 API Key（qwen_api_key 或环境变量 DASHSCOPE_API_KEY）")
         else:
             self.logger.info("检测到自定义渠道：%s，跳过配置校验。", channel)
 
@@ -1129,6 +1145,8 @@ class LexiSharpApp:
             return "火山引擎"
         if channel == "soniox":
             return "Soniox"
+        if channel in {"qwen", "tongyi", "tongyiqianwen", "dashscope"}:
+            return "通义千问"
         return channel or "火山引擎"
 
     def _open_settings(self) -> None:
@@ -1164,6 +1182,8 @@ class LexiSharpApp:
             return self._call_volcengine(audio_file)
         if channel == "soniox":
             return self._call_soniox(audio_file)
+        if channel in {"qwen", "tongyi", "tongyiqianwen", "dashscope"}:
+            return self._call_qwen(audio_file)
         raise RuntimeError(f"未识别的识别渠道：{channel}")
 
     def _call_volcengine(self, audio_file: str) -> Optional[str]:
@@ -1376,6 +1396,127 @@ class LexiSharpApp:
                 parts.append(f"[{language}] ")
             parts.append(text)
         return "".join(parts)
+
+    def _call_qwen(self, audio_file: str) -> Optional[str]:
+        """
+        调用通义千问录音识别接口（DashScope 多模态会话模型）。
+        """
+        if dashscope is None:
+            raise RuntimeError("未安装 dashscope 库，请执行 `pip install dashscope` 后重试。")
+
+        api_key = os.environ.get("DASHSCOPE_API_KEY") or self.config.get("qwen_api_key")
+        if "在此填写" in str(api_key) or not str(api_key).strip():
+            raise RuntimeError("未配置通义千问 API Key，请在环境变量 DASHSCOPE_API_KEY 或配置项 qwen_api_key 中填写。")
+
+        model = (self.config.get("qwen_model") or CONFIG_TEMPLATE["qwen_model"]).strip() or CONFIG_TEMPLATE["qwen_model"]
+        context_text = str(self.config.get("qwen_context") or "").strip()
+        language = str(self.config.get("qwen_language") or "").strip()
+        enable_lid = bool(self.config.get("qwen_enable_lid", CONFIG_TEMPLATE["qwen_enable_lid"]))
+        enable_itn = bool(self.config.get("qwen_enable_itn", CONFIG_TEMPLATE["qwen_enable_itn"]))
+
+        try:
+            audio_uri = Path(audio_file).resolve().as_uri()
+        except ValueError:
+            audio_uri = f"file://{Path(audio_file).resolve()}"
+
+        messages: List[dict[str, object]] = []
+        if context_text:
+            messages.append({
+                "role": "system",
+                "content": [{"text": context_text}]
+            })
+        messages.append({
+            "role": "user",
+            "content": [{"audio": audio_uri}]
+        })
+
+        asr_options: dict[str, object] = {
+            "enable_lid": enable_lid,
+            "enable_itn": enable_itn
+        }
+        if language:
+            asr_options["language"] = language
+
+        timeout = max(15, int(self.config.get("max_wait_s", CONFIG_TEMPLATE["max_wait_s"])))
+
+        self.logger.info(
+            "准备调用通义千问，模型：%s，语种提示：%s，启用语种检测：%s，启用逆文本规范化：%s",
+            model,
+            language or "自动检测",
+            "是" if enable_lid else "否",
+            "是" if enable_itn else "否"
+        )
+
+        try:
+            response = dashscope.MultiModalConversation.call(
+                api_key=str(api_key).strip(),
+                model=model,
+                messages=messages,
+                result_format="message",
+                asr_options=asr_options,
+                request_timeout=timeout
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.exception("通义千问接口调用失败")
+            raise RuntimeError(f"通义千问调用失败：{exc}") from exc
+
+        status_code = int(response.get("status_code", HTTPStatus.OK))
+        if status_code != HTTPStatus.OK:
+            error_code = response.get("code") or status_code
+            error_message = response.get("message") or "未知错误"
+            raise RuntimeError(f"通义千问接口返回异常：{error_code} - {error_message}")
+
+        output = response.get("output") or {}
+        text_fragments: List[str] = []
+        annotations_languages: List[str] = []
+
+        if isinstance(output, dict):
+            choices = output.get("choices") or []
+            if choices:
+                first_choice = choices[0] or {}
+                message_payload = first_choice.get("message") if isinstance(first_choice, dict) else None
+                if message_payload is None:
+                    message_payload = getattr(first_choice, "message", None)
+                if message_payload:
+                    if isinstance(message_payload, dict):
+                        annotations = message_payload.get("annotations") or []
+                        content = message_payload.get("content") or []
+                    else:
+                        annotations = getattr(message_payload, "annotations", []) or []
+                        content = getattr(message_payload, "content", []) or []
+                    for annotation in annotations:
+                        if isinstance(annotation, dict):
+                            lang = str(annotation.get("language") or "").strip()
+                            if lang:
+                                annotations_languages.append(lang)
+                    for item in content:
+                        if isinstance(item, dict):
+                            snippet = str(item.get("text") or "").strip()
+                            if snippet:
+                                text_fragments.append(snippet)
+            if not text_fragments:
+                direct_text = output.get("text")
+                if isinstance(direct_text, str) and direct_text.strip():
+                    text_fragments.append(direct_text.strip())
+        else:
+            self.logger.debug("通义千问返回的 output 非字典类型：%s", type(output))
+
+        text = "".join(text_fragments).strip()
+        if not text:
+            self.logger.debug("通义千问原始响应：%s", response)
+            raise RuntimeError("通义千问 API 未返回可用文本，请检查音频文件或日志。")
+
+        if annotations_languages:
+            ordered_unique = list(dict.fromkeys(annotations_languages))
+            self.logger.info("通义千问识别到的语种：%s", "、".join(ordered_unique))
+
+        usage = response.get("usage") or {}
+        if isinstance(usage, dict):
+            duration = usage.get("seconds")
+            if duration is not None:
+                self.logger.info("通义千问计费时长：%s 秒", duration)
+
+        return text
 
     def _auto_paste_async(self) -> bool:
         """
@@ -1732,6 +1873,7 @@ class SettingsDialog:
     CHANNEL_OPTIONS = [
         ("volcengine", "火山引擎（Volcengine）"),
         ("soniox", "Soniox"),
+        ("qwen", "通义千问（Qwen）"),
     ]
 
     CHANNEL_FIELDS: dict[str, list[dict[str, object]]] = {
@@ -1823,6 +1965,45 @@ class SettingsDialog:
                 "type": "entry",
                 "value_type": float,
                 "default": CONFIG_TEMPLATE["soniox_poll_timeout_s"],
+            },
+        ],
+        "qwen": [
+            {
+                "key": "qwen_api_key",
+                "label": "API Key",
+                "type": "entry",
+                "help": "必填：百炼控制台生成的 DashScope API Key，可使用环境变量 DASHSCOPE_API_KEY。",
+            },
+            {
+                "key": "qwen_model",
+                "label": "模型名称",
+                "type": "entry",
+                "default": CONFIG_TEMPLATE["qwen_model"],
+                "help": "默认 qwen3-asr-flash，如需体验版可改为 qwen-audio-asr。",
+            },
+            {
+                "key": "qwen_context",
+                "label": "上下文（Context）",
+                "type": "text",
+                "height": 4,
+                "help": "可选：用于优化识别的行业词、专有名词等提示文本。",
+            },
+            {
+                "key": "qwen_language",
+                "label": "指定语种（可选）",
+                "type": "entry",
+                "help": "可选值如 zh、en、yue，留空则自动检测语种。",
+            },
+            {
+                "key": "qwen_enable_lid",
+                "label": "启用语种识别",
+                "type": "boolean",
+            },
+            {
+                "key": "qwen_enable_itn",
+                "label": "启用逆文本规范化",
+                "type": "boolean",
+                "help": "开启后会输出更规范的数字/单位格式（仅支持中英文）。",
             },
         ],
     }

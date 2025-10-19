@@ -67,6 +67,7 @@ pip install -r requirements.txt
 
 - `volcengine`（默认）：火山引擎大模型录音文件极速版 API。
 - `soniox`：Soniox Speech-to-Text Async API（参考 https://soniox.com/docs/stt/get-started）。
+- `qwen`：通义千问录音文件识别（Qwen3-ASR/Qwen-Audio-ASR，参考 https://help.aliyun.com/zh/model-studio/qwen-speech-recognition）。
 
 首次运行 `python lexisharp.py` 会生成配置模板，核心字段示例如下（Soniox 相关字段在使用火山引擎时可保持默认）：
 
@@ -127,9 +128,30 @@ pip install -r requirements.txt
 3. Soniox 也支持通过环境变量传参（优先级高于配置文件）：
    ```bash
    export SONIOX_API_KEY=你的SonioxAPIKey
-   export SONIOX_MODEL=stt-async-preview
-   ```
+  export SONIOX_MODEL=stt-async-preview
+```
 4. 当识别完成后，程序会自动清理已上传的文件与任务，可在日志中查看对应的 `client_reference_id`（与请求一致）。若需要更多参数示例，可参考官方文档：https://soniox.com/docs/stt/async/async-transcription
+
+### 通义千问（qwen）
+
+1. 登录 [阿里云百炼](https://bailian.console.aliyun.com/?tab=model#/api-key) 并创建 DashScope API Key。建议将密钥保存为环境变量：
+   ```bash
+   export DASHSCOPE_API_KEY=sk-xxxx
+   ```
+   若不使用环境变量，请在 `~/.lexisharp-linux/config.json` 的 `qwen_api_key` 字段填写完整密钥。
+2. 安装通义千问官方 SDK：
+   ```bash
+   pip install dashscope
+   ```
+   应用会在检测到缺失时给出提示，未安装将无法调用该渠道。
+3. 在设置中选择「通义千问（Qwen）」，按需配置：
+   - `qwen_model`：默认使用 `qwen3-asr-flash`（生产环境推荐）。如需体验多语种 Beta 版本，可设为 `qwen-audio-asr`。
+   - `qwen_context`：可选的上下文提示，用于增强专业词汇识别。
+   - `qwen_language`：可选的语种提示（如 `zh`、`en`、`yue`），留空则由模型自动检测。
+   - `qwen_enable_lid`：是否在返回结果中附带语种识别信息。
+   - `qwen_enable_itn`：开启后通义千问会对数字、金额等文本做逆文本规范化（目前支持中英文）。
+4. 通义千问要求音频格式为 16kHz 单声道，且单次调用不超过 10MB / 3 分钟。程序默认录音参数已满足要求，如遇超长录音可在界面中手动停止或拆分上传。
+5. 更多参数说明与最佳实践，可参考官方文档《录音文件识别-通义千问》：https://help.aliyun.com/zh/model-studio/qwen-speech-recognition
 
 ## 使用步骤
 
