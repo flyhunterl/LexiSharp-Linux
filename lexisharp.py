@@ -51,6 +51,17 @@ except Exception:  # 允许缺失
     np = None
     sherpa_onnx = None
 
+# 可选图像处理：用于加载/缩放图标（asr.png/svg）
+try:  # pragma: no cover
+    from PIL import Image, ImageTk  # type: ignore[import]
+except Exception:
+    Image = None  # type: ignore[assignment]
+    ImageTk = None  # type: ignore[assignment]
+try:  # pragma: no cover
+    import cairosvg  # type: ignore[import]
+except Exception:
+    cairosvg = None  # type: ignore[assignment]
+
 #（已移除 Hugging Face 一键下载支持）
 
 try:
@@ -945,10 +956,11 @@ class FloatingButton:
         self.size = max(50, int(size))
         self._dragging = False
         self._press_offset = (0, 0)
+        self._icon_img: Optional[tk.PhotoImage] = None
 
         self.button = tk.Button(
             self.top,
-            text="开始",
+            text="",
             bg="#4CAF50",
             fg="white",
             activebackground="#388E3C",
@@ -965,6 +977,14 @@ class FloatingButton:
         self.button.bind("<ButtonRelease-1>", self._on_release)
 
         self.top.geometry(f"{self.size}x{self.size}+120+120")
+        # 设置窗口图标（与主窗口一致）
+        try:
+            if self.app._app_icon_photo is not None:
+                self.top.iconphoto(True, self.app._app_icon_photo)
+        except Exception:
+            pass
+        # 应用图标到按钮
+        self._apply_icon()
         self.top.deiconify()
 
     def update_size(self, size: int) -> None:
@@ -975,22 +995,20 @@ class FloatingButton:
         x = self.top.winfo_x() if self.top.winfo_ismapped() else 120
         y = self.top.winfo_y() if self.top.winfo_ismapped() else 120
         self.top.geometry(f"{self.size}x{self.size}+{x}+{y}")
+        self._apply_icon()
 
     def set_state(self, state: str) -> None:
         """
         根据状态调整显示样式。
         """
         bg, active_bg, text = self.STATE_STYLE.get(state, self.STATE_STYLE["idle"])
-        short_text = {
-            "开始录音": "开始",
-            "录音中…": "录音",
-            "识别中…": "处理"
-        }.get(text, text)
         self.button.configure(
             bg=bg,
             activebackground=active_bg,
-            text=short_text
+            text=""
         )
+        # 始终使用图标展示
+        self._apply_icon()
 
     def destroy(self) -> None:
         """
@@ -1017,6 +1035,21 @@ class FloatingButton:
         if not self._dragging:
             self.app.root.after(0, self.app.toggle_recording)
         self._dragging = False
+
+    def _apply_icon(self) -> None:
+        """根据当前尺寸获取图标并应用到按钮。"""
+        try:
+            # 给图标留一点内边距
+            icon_size = max(24, int(self.size * 0.7))
+            img = self.app.get_icon_for_size(icon_size)
+            if img is not None:
+                self._icon_img = img  # 保存引用，避免被 GC
+                self.button.configure(image=self._icon_img, compound=tk.CENTER)
+            else:
+                # 无图标时显示短文本
+                self.button.configure(image="", text="录音")
+        except Exception:
+            self.button.configure(image="", text="录音")
 
 
 class LexiSharpApp:
@@ -1076,6 +1109,14 @@ class LexiSharpApp:
         self._local_sherpa_recognizer: Optional[object] = None
         self._local_sherpa_sr: int = 16000
 
+        # 应用图标缓存
+        self._app_icon_photo: Optional[tk.PhotoImage] = None
+        self._icon_cache: dict[int, tk.PhotoImage] = {}
+        self._icon_source_path: Optional[str] = None
+        self._icon_base_pil = None  # type: ignore[assignment]
+
+        self._setup_theme()
+        self._init_icons()
         self._build_ui()
         self._update_floating_controls_state()
         self._schedule_level_update()
@@ -1092,82 +1133,59 @@ class LexiSharpApp:
         构建界面组件。
         """
         self.root.title("LexiSharp-linux")
-        self.root.geometry("480x520")
+        self.root.geometry("500x500")
         self.root.resizable(False, False)
 
-        font_title = ("WenQuanYi Micro Hei", 16, "bold")
+        font_title = ("WenQuanYi Micro Hei", 18, "bold")
         font_body = ("WenQuanYi Micro Hei", 12)
 
-        header_frame = tk.Frame(self.root)
-        header_frame.pack(fill=tk.X, pady=(20, 10), padx=20)
+        # 顶部两按钮并排：开始录音 / 设置（等宽）
+        btn_bar = ttk.Frame(self.root, padding=(20, 16))
+        btn_bar.pack(fill=tk.X)
+        btn_bar.columnconfigure(0, weight=1)
+        btn_bar.columnconfigure(1, weight=1)
 
-        title_label = tk.Label(
-            header_frame,
-            text="LexiSharp-linux",
-            font=font_title
-        )
-        title_label.pack(side=tk.LEFT)
-
-        settings_button = tk.Button(
-            header_frame,
-            text="设置",
-            command=self._open_settings,
-            font=("WenQuanYi Micro Hei", 11),
-            width=8
-        )
-        settings_button.pack(side=tk.RIGHT)
-
-        hotkey_info = ""
-        if self.start_hotkey and self.stop_hotkey:
-            hotkey_info = (
-                f"\n全局快捷键：开始录音 {self.start_hotkey.upper()}，"
-                f"结束录音 {self.stop_hotkey.upper()}。"
-            )
-
-        instruction = (
-            "操作说明：点击下方按钮开始录音，再次点击结束并识别。\n"
-            "识别成功后文本会复制到剪贴板，并且自动粘贴到目标窗口。\n"
-            "可在下方启用“显示浮动录音按钮”以使用可拖动的置顶录音键。"
-            f"{hotkey_info}"
-        )
-        instruction_label = tk.Label(
-            self.root,
-            text=instruction,
-            wraplength=360,
-            justify=tk.LEFT,
-            font=font_body
-        )
-        instruction_label.pack(pady=(0, 10), padx=20)
-
-        self.record_button = tk.Button(
-            self.root,
+        self.record_button = ttk.Button(
+            btn_bar,
             textvariable=self.button_text,
             command=self.toggle_recording,
-            font=("WenQuanYi Micro Hei", 14),
-            width=16,
-            height=2,
-            bg="#4CAF50",
-            fg="white",
-            activebackground="#45A049"
+            style="Record.TButton",
         )
-        self.record_button.pack(pady=10)
+        self.record_button.grid(row=0, column=0, sticky="ew", padx=(0, 8))
 
-        floating_frame = tk.Frame(self.root)
+        settings_button = ttk.Button(
+            btn_bar,
+            text="设置",
+            command=self._open_settings,
+            style="Record.TButton",
+        )
+        settings_button.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+
+        # 主页其余内容
+        main_frame = ttk.Frame(self.root, padding=(20, 0))
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # 设置主窗口图标（如果找到 asr.png/svg）
+        if self._app_icon_photo is not None:
+            try:
+                self.root.iconphoto(True, self._app_icon_photo)
+            except Exception:
+                pass
+
+        floating_frame = ttk.Frame(main_frame)
         floating_frame.pack(pady=(4, 0))
 
-        floating_toggle = tk.Checkbutton(
+        floating_toggle = ttk.Checkbutton(
             floating_frame,
             text="显示浮动录音按钮",
             variable=self.floating_enabled_var,
-            command=self._toggle_floating_button,
-            font=font_body
+            command=self._toggle_floating_button
         )
         floating_toggle.pack(side=tk.LEFT)
 
-        size_label = tk.Label(
+        size_label = ttk.Label(
             floating_frame,
-            text="按钮大小",
-            font=font_body
+            text="按钮大小"
         )
         size_label.pack(side=tk.LEFT, padx=(16, 4))
 
@@ -1184,45 +1202,142 @@ class LexiSharpApp:
         )
         self.floating_size_scale.pack(side=tk.LEFT)
 
-        level_label = tk.Label(
-            self.root,
-            text="实时音量检测",
-            font=font_body
+        level_label = ttk.Label(
+            main_frame,
+            text="实时音量检测"
         )
         level_label.pack(pady=(0, 4))
 
         self.level_bar = ttk.Progressbar(
-            self.root,
+            main_frame,
             orient=tk.HORIZONTAL,
             length=360,
             mode="determinate",
             maximum=100,
             variable=self.level_var
         )
-        self.level_bar.pack(padx=20, fill=tk.X)
+        self.level_bar.pack(fill=tk.X)
 
-        status_label = tk.Label(
-            self.root,
+        status_label = ttk.Label(
+            main_frame,
             textvariable=self.status_var,
             wraplength=360,
             justify=tk.LEFT,
-            font=font_body,
-            fg="#333333"
+            # 字体通过主题控制
         )
-        status_label.pack(pady=(10, 4))
+        status_label.pack(pady=(10, 4), fill=tk.X)
 
-        result_frame = tk.LabelFrame(self.root, text="最近识别结果", font=font_body)
-        result_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=(4, 16))
+        result_frame = ttk.LabelFrame(main_frame, text="最近识别结果")
+        result_frame.pack(fill=tk.BOTH, expand=True, pady=(4, 16))
 
-        result_display = tk.Label(
+        result_display = ttk.Label(
             result_frame,
             textvariable=self.result_var,
             wraplength=360,
             justify=tk.LEFT,
-            font=font_body,
-            fg="#000000"
+            # 字体通过主题控制
         )
         result_display.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+
+    def _setup_theme(self) -> None:
+        """配置 ttk 主题与样式。"""
+        try:
+            style = ttk.Style(self.root)
+            # 选择通用主题
+            try:
+                style.theme_use("clam")
+            except Exception:
+                pass
+
+            style.configure("Header.TButton", padding=8)
+            # 录音按钮样式
+            style.configure(
+                "Record.TButton",
+                font=("WenQuanYi Micro Hei", 14, "bold"),
+                padding=14
+            )
+        except Exception:
+            pass
+
+    def _init_icons(self) -> None:
+        """尝试从当前目录或脚本目录加载 asr.png 或 asr.svg 作为程序图标。"""
+        candidates = []
+        try:
+            here = Path.cwd()
+            candidates.extend([here / "asr.png", here / "asr.svg"])
+        except Exception:
+            pass
+        try:
+            script_dir = Path(__file__).resolve().parent
+            candidates.extend([script_dir / "asr.png", script_dir / "asr.svg"])
+        except Exception:
+            pass
+
+        icon_path: Optional[Path] = None
+        for p in candidates:
+            try:
+                if p.exists():
+                    icon_path = p
+                    break
+            except Exception:
+                continue
+
+        if not icon_path:
+            return
+        self._icon_source_path = str(icon_path)
+
+        try:
+            if icon_path.suffix.lower() == ".png":
+                # 直接用 Tk PhotoImage；同时若有 PIL 则保留 PIL 以便缩放
+                self._app_icon_photo = tk.PhotoImage(file=str(icon_path))
+                if Image is not None:
+                    self._icon_base_pil = Image.open(str(icon_path)).convert("RGBA")
+            elif icon_path.suffix.lower() == ".svg":
+                # 尝试用 cairosvg 转 PNG，再用 PIL 读
+                if cairosvg is not None and Image is not None and ImageTk is not None:
+                    png_bytes = cairosvg.svg2png(url=str(icon_path))
+                    from io import BytesIO
+                    self._icon_base_pil = Image.open(BytesIO(png_bytes)).convert("RGBA")
+                    # 生成一个中等大小的 PhotoImage 作为窗口图标
+                    im64 = self._icon_base_pil.copy()
+                    im64.thumbnail((64, 64), Image.LANCZOS)
+                    self._app_icon_photo = ImageTk.PhotoImage(im64)
+                else:
+                    # 无法处理 svg，忽略
+                    return
+        except Exception:
+            # 加载失败则放弃图标设置
+            self._app_icon_photo = None
+            self._icon_base_pil = None
+            return
+
+    def get_icon_for_size(self, size: int) -> Optional[tk.PhotoImage]:
+        """返回指定像素大小的 PhotoImage，用于浮动按钮等。"""
+        if size <= 0:
+            return None
+        if size in self._icon_cache:
+            return self._icon_cache[size]
+        try:
+            if self._icon_base_pil is not None and ImageTk is not None:
+                im = self._icon_base_pil.copy()
+                im.thumbnail((size, size), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(im)
+                self._icon_cache[size] = photo
+                return photo
+            # 无 PIL，则尝试基于 Tk PhotoImage 缩放（只能近似）
+            if self._app_icon_photo is not None:
+                w = self._app_icon_photo.width()
+                if w > 0:
+                    factor = max(1, int(round(w / max(1, size))))
+                    try:
+                        photo = self._app_icon_photo.subsample(factor)
+                        self._icon_cache[size] = photo
+                        return photo
+                    except Exception:
+                        return self._app_icon_photo
+        except Exception:
+            return None
+        return None
 
     def _collect_missing_fields(self, config: dict) -> tuple[list[str], str]:
         """
@@ -2907,7 +3022,7 @@ class SettingsDialog:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.canvas.configure(yscrollcommand=scrollbar.set)
 
-        self.channel_frame = tk.Frame(self.canvas)
+        self.channel_frame = ttk.Frame(self.canvas)
         self._canvas_window = self.canvas.create_window((0, 0), window=self.channel_frame, anchor="nw")
         self.channel_frame.bind("<Configure>", lambda _event: self._update_scroll_region())
         self.canvas.bind("<Configure>", self._on_canvas_configure)
@@ -2915,10 +3030,10 @@ class SettingsDialog:
         self.canvas.bind("<Button-4>", self._on_mousewheel)  # Linux scroll up
         self.canvas.bind("<Button-5>", self._on_mousewheel)  # Linux scroll down
 
-        button_frame = tk.Frame(self.window, padx=18, pady=12)
+        button_frame = ttk.Frame(self.window, padding=(18, 12))
         button_frame.pack(fill=tk.X, pady=(0, 12))
 
-        save_button = tk.Button(
+        save_button = ttk.Button(
             button_frame,
             text="保存",
             width=10,
@@ -2926,7 +3041,7 @@ class SettingsDialog:
         )
         save_button.pack(side=tk.RIGHT, padx=(6, 0))
 
-        cancel_button = tk.Button(
+        cancel_button = ttk.Button(
             button_frame,
             text="取消",
             width=10,
