@@ -1,24 +1,56 @@
 # LexiSharp-linux
 
+<div align="center">
+
+🎙️ 轻量级本地/云端语音输入｜录音 → 识别 → 粘贴
+
+简体中文 | [English](README_EN.md)
+
+[![Platform](https://img.shields.io/badge/Platform-Linux-green.svg)](https://www.linux.org/)
+[![Language](https://img.shields.io/badge/Language-Python-blue.svg)](https://www.python.org/)
+[![Toolkit](https://img.shields.io/badge/Toolkit-Tkinter-blueviolet.svg)](https://docs.python.org/3/library/tkinter.html)
+[![ASR](https://img.shields.io/badge/ASR-sherpa--onnx-orange.svg)](https://github.com/k2-fsa/sherpa-onnx)
+
+[功能概览](#-功能概览) • [UI 展示](#-ui-展示) • [快速开始](#-快速开始) • [识别渠道配置](#-识别渠道配置) • [使用步骤](#-使用步骤) • [常见问题](#-常见问题)
+
+</div>
+
 LexiSharp-linux 是一款运行于 Linux 桌面的轻量级语音输入工具，围绕“录音 → 识别 → 粘贴”这一流程展开，实现最小成本的语音转文字体验。
-支持火山引擎、通义千问、Soniox的ASR模型。
-新增：可选接入本地离线引擎 sherpa-onnx（small/full 一键配置与导入；支持 GitHub 加速下载与自动解压配置）。
-项目灵感来源于安卓版LexiSharp。安卓版版本已经是一个非常完善且功能强大的版本！地址：https://github.com/BryceWG/LexiSharp-Keyboard
+支持火山引擎、通义千问、Soniox 及一键配置本地离线引擎。💡 基于 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 实现。
+项目灵感来源于安卓版 [LexiSharp-Keyboard](https://github.com/BryceWG/LexiSharp-Keyboard)，其移动端版本已非常完善且功能强大。
 
+## 🖼️ UI 展示
 
+<table>
+<tr>
+<td align="center" width="50%">
+<img width="500" height="522" alt="主页" src="https://github.com/user-attachments/assets/c211671b-00cf-431a-9cd7-762de9022eb4" />
+<br/>
+<sub>主页</sub>
+</td>
+<td align="center" width="50%">
+<img width="519" height="586" alt="设置界面" src="https://github.com/user-attachments/assets/79173728-e92b-49cf-952c-710ad8026641" />
+<br/>
+<sub>设置界面</sub>
+</td>
+</tr>
+</table>
 
+<p align="center">
+  <video src="demo.webm" width="520" controls></video>
+  <br/>
+  <sub>演示：录音 → 识别 → 自动粘贴</sub>
+  <br/>
+</p>
 
-<img width="479" height="547" alt="image" src="https://github.com/user-attachments/assets/26d7d875-26da-4004-8270-305192cf16f3" />
-
-
-## 功能概览
+## ✨ 功能概览
 - **一键录音**：主界面仅保留“开始/停止录音”按钮，同时可选启用悬浮按钮（置顶、可拖拽）。
-- **极速转写**：集成火山引擎大模型录音文件极速版识别 API，并可选择 Soniox 等渠道。
-- **自动输入**：默认通过 Fcitx DBus 接口将识别结果直接提交至当前输入环境，避免覆盖剪贴板；当 DBus 不可用时自动使用剪贴板 进行输入。（Wayland 下推荐安装 `wl-clipboard`）。
-- **配置简明**：首次启动生成 `~/.lexisharp-linux/config.json` 模板，填入密钥即可使用。
+- **极速转写**：支持火山引擎、阿里前文、Soniox，本地离线引擎等渠道。
+- **自动输入**：默认通过 Fcitx DBus 接口将识别结果直接提交至当前输入环境；当 DBus 不可用时自动使用剪贴板 进行输入。（Wayland 下需安装 `wl-clipboard`）。
+- **配置简明**：支持可视化操作也支持通过配置文件 `~/.lexisharp-linux/config.json` 深度自定义。
 
-#  通过程序启动
-## 下载Releases最新版本
+## 🚀 快速开始
+### 下载 Releases 最新版本（推荐）
 
 
 # 从源码启动
@@ -61,10 +93,10 @@ Python 依赖
 pip install -r requirements.txt
 ```
 
-> 若在 Wayland 环境启用 `auto_paste`，请确保已安装 `wl-clipboard`（Arch使用 `paru -S wl-clipboard`安装））。程序会通过 `python-evdev`（已在 `requirements.txt` 中）创建虚拟键盘自动发送 `Ctrl+V`。 
+> 若在 Wayland 环境启用 `auto_paste`，请确保已安装 `wl-clipboard`（Arch使用 `paru -S wl-clipboard`安装）。 
 
 
-## 识别渠道配置
+## ⚙️ 识别渠道配置
 
 ### 通过设置界面设置
 当前版本已支持可视化设置，通过设置按钮进入设置。如需更多设置可参考下文。
@@ -74,7 +106,6 @@ pip install -r requirements.txt
   - 预设默认链接：
     - small（≈300MB，INT8）：https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09.tar.bz2
     - full（≈900MB，FP）：https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2
-  - 加速示例：将任一 GitHub 直链前缀改为 `https://gh-proxy.com/` 或 `https://edgeone.gh-proxy.com/` 即可。
 
 ### 手动配置
 通过 `~/.lexisharp-linux/config.json` 中的 `channel` 字段选择识别服务：
@@ -84,7 +115,7 @@ pip install -r requirements.txt
 - `qwen`：通义千问录音文件识别（Qwen3-ASR/Qwen-Audio-ASR，参考 https://help.aliyun.com/zh/model-studio/qwen-speech-recognition）。
 - `local_sherpa`：本地离线识别（sherpa-onnx）。需安装 `sherpa-onnx onnxruntime numpy`，并准备模型目录（见设置说明）。
 
-首次运行 `python lexisharp.py` 会生成配置模板，核心字段示例如下（Soniox 相关字段在使用火山引擎时可保持默认）：
+首次运行 `python lexisharp.py` 会生成配置模板，核心字段示例如下：
 
 ```json
 {
@@ -168,7 +199,7 @@ pip install -r requirements.txt
 4. 通义千问要求音频格式为 16kHz 单声道，且单次调用不超过 10MB / 3 分钟。程序默认录音参数已满足要求，如遇超长录音可在界面中手动停止或拆分上传。
 5. 更多参数说明与最佳实践，可参考官方文档《录音文件识别-通义千问》：https://help.aliyun.com/zh/model-studio/qwen-speech-recognition
 
-## 输入方式选择
+## ⌨️ 输入方式选择
 
 LexiSharp 默认优先使用 Fcitx DBus 接口直接提交文本，并在失败时自动回退到传统的剪贴板 兼容模式。若需要强制切换，可在 `~/.lexisharp-linux/config.json` 中调整以下配置：
 
@@ -191,21 +222,18 @@ LexiSharp 默认优先使用 Fcitx DBus 接口直接提交文本，并在失败�
 
 当 DBus 调用成功时，状态栏会提示“已通过输入法自动提交到目标窗口，剪贴板保持原样”；如遇失败并允许回退，程序会自动复制文本并继续使用原有注入流程。
 
-## 使用步骤
 
-### 当前项目初级极端更新频繁，暂不提供程序启动，请手动启动或者通过脚本启动程序。
-
-#### 手动启动
+### 手动启动
 ```bash
 source ~/.venvs/lexisharp/bin/activate
 python lexisharp.py
 ```
-####  使用一键脚本
+### 使用一键脚本
 ```
 chmod +x lexisharp.sh
 
 ```
-arch可直接通过alt+空格键输入lexisharp.sh运行
+
 
 1. 激活目标应用并让光标停留在文本输入框。
 2. 回到 LexiSharp-linux，点击“开始”或使用默认热键 `Ctrl+Alt+A` 开始录音。
@@ -213,7 +241,7 @@ arch可直接通过alt+空格键输入lexisharp.sh运行
 4. 识别结果会自动复制到剪贴板，并尝试自动粘贴到目标窗口；若未成功，可手动使用 `Ctrl+V` 粘贴。
 5. 可在界面勾选“显示浮动录音按钮”，获得置顶的悬浮录音键。
 
-> 提示：`auto_paste` 默认开启。，程序会在复制成功后自动向目标窗口注入内容；若遇到兼容性问题，可随时关闭并手动粘贴。
+> 提示：`auto_paste` 默认开启。，程序会在复制成功后自动向目标窗口注入内容。
 
 ## 常见问题
 - **提示未找到 arecord**：确认已安装 `alsa-utils`，终端执行 `arecord -h` 验证。
@@ -234,9 +262,3 @@ arch可直接通过alt+空格键输入lexisharp.sh运行
 - 支持更多第三方 ASR 服务或本地模型。
 - 改进 UI 体验与配置流程。
 - 提供更完善的自动粘贴兼容方案。
-
-## CI 打包发布
-- 本地打包：执行 `pyinstaller pyinstaller.spec --noconfirm --clean --distpath dist --workpath build`，可在 `dist/lexisharp/` 目录获得可执行文件。
-- GitHub Actions：仓库新增 `build-linux` 工作流，默认在推送 `v*` 标签时自动触发，也可通过 Actions 页面手动运行。构建完成后会在工作流页面生成 `lexisharp-linux` 工件，内含压缩包 `lexisharp-linux.tar.gz`。
-
-欢迎根据自身需求进行二次开发。LexiSharp-linux 希望成为可拓展的语音输入基础工具。***
