@@ -117,7 +117,13 @@ CONFIG_TEMPLATE = {
     "local_sherpa_model_dir_full": str((CONFIG_DIR / "models/zh-full").as_posix()),
     # 推理提供者与线程数：provider=cpu/cuda；num_threads 控制 onnxruntime 线程
     "local_sherpa_provider": "cpu",
-    "local_sherpa_threads": 2,
+    "local_sherpa_threads": 4,
+    # 是否在 CPU 下优先选择量化（int8）模型
+    "local_sherpa_prefer_int8": True,
+    # 是否在送入 ASR 前做前后去静音（简单能量阈值）
+    "local_sherpa_trim_silence": False,
+    # 去静音阈值（0.0~1.0，幅度），适度调大以更激进裁剪
+    "local_sherpa_vad_threshold": 0.01,
     # 仅保留 GitHub Releases 下载方式
 }
 
@@ -1871,7 +1877,8 @@ class LexiSharpApp:
             raise RuntimeError("未在模型目录中找到 .onnx 文件，请检查模型是否完整。")
 
         provider = (self.config.get("local_sherpa_provider") or "cpu").strip().lower()
-        num_threads = max(1, int(self.config.get("local_sherpa_threads", 2)))
+        num_threads = max(1, int(self.config.get("local_sherpa_threads", 4)))
+        prefer_int8 = bool(self.config.get("local_sherpa_prefer_int8", True))
 
         # 根据文件名/数量做粗略类型识别
         model_type = self._detect_sherpa_model_type(onnx_files)
@@ -1887,6 +1894,15 @@ class LexiSharpApp:
         samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         if sr != self._local_sherpa_sr:
             self.logger.warning("采样率不匹配：录音=%d，预期=%d，将按原样送入。", sr, self._local_sherpa_sr)
+        # 去静音（可选，仅前后裁剪）
+        if bool(self.config.get("local_sherpa_trim_silence", False)):
+            try:
+                thr = float(self.config.get("local_sherpa_vad_threshold", 0.01))
+            except Exception:
+                thr = 0.01
+            trimmed = self._trim_silence(samples, sr, threshold=thr)
+            if trimmed is not None and len(trimmed) > 0:
+                samples = trimmed
 
         # 决策解码策略：paraformer 优先 modified_beam_search；其他优先 greedy
         methods: list[str]
@@ -1917,6 +1933,7 @@ class LexiSharpApp:
                         provider=provider,
                         num_threads=num_threads,
                         decoding_method=dmethod,
+                        prefer_int8=prefer_int8,
                     )
                     self._local_sherpa_signature = signature
                 except Exception as exc:
@@ -1969,6 +1986,49 @@ class LexiSharpApp:
             raise RuntimeError(f"本地引擎识别失败：{last_err}")
         return None
 
+    def _trim_silence(self, samples: "np.ndarray", sr: int, threshold: float = 0.01) -> Optional["np.ndarray"]:
+        """简单前后去静音：基于幅度阈值裁剪头尾的近静音段。
+        threshold 为归一化幅度阈值（0~1），默认 0.01。
+        若整段都低于阈值，则返回原始 samples 以避免误删。
+        """
+        try:
+            if samples is None or len(samples) == 0:
+                return samples
+            x = np.abs(samples)
+            # 以 20ms 为一帧做快速扫描
+            frame = max(1, int(sr * 0.02))
+            n = len(x)
+            # 找到第一个超过阈值的帧起点
+            start = 0
+            while start < n:
+                end = min(n, start + frame)
+                if x[start:end].max() >= threshold:
+                    break
+                start = end
+            # 全静音：直接返回原始
+            if start >= n:
+                return samples
+            # 找到最后一个超过阈值的帧终点
+            tail = n
+            pos = n
+            while pos > 0:
+                s = max(0, pos - frame)
+                if x[s:pos].max() >= threshold:
+                    break
+                pos = s
+            tail = pos
+            # 保护：至少保留 0.3s 音频
+            min_keep = int(sr * 0.3)
+            if tail - start < min_keep:
+                # 尝试扩展至最小长度
+                mid = (start + tail) // 2
+                start = max(0, mid - min_keep // 2)
+                tail = min(n, start + min_keep)
+            return samples[start:tail]
+        except Exception:
+            # 安全兜底：若出错不裁剪
+            return samples
+
     def _detect_sherpa_model_type(self, onnx_files: list[Path]) -> str:
         """基于路径/文件名推断模型类型，返回 `sense_voice`/`transducer`/`paraformer`/`whisper`。"""
         names = {p.name.lower() for p in onnx_files}
@@ -1993,6 +2053,7 @@ class LexiSharpApp:
         provider: str,
         num_threads: int,
         decoding_method: str = "greedy_search",
+        prefer_int8: bool = True,
     ):
         """根据推断的模型类型构建 OfflineRecognizer。"""
         mc = None
@@ -2012,9 +2073,7 @@ class LexiSharpApp:
             )
         elif model_type == "sense_voice":
             # SenseVoice 专用配置
-            model_path = ""
-            if onnx_files:
-                model_path = str(max(onnx_files, key=lambda p: p.stat().st_size))
+            model_path = self._choose_model_file(onnx_files, prefer_int8, provider)
             sv_cfg = sherpa_onnx.OfflineSenseVoiceModelConfig(
                 model=model_path,
                 language="auto",
@@ -2047,10 +2106,7 @@ class LexiSharpApp:
                 provider=provider,
             )
         else:  # paraformer（默认）
-            model_path = ""
-            # 选取体积最大的 .onnx 作为主模型
-            if onnx_files:
-                model_path = str(max(onnx_files, key=lambda p: p.stat().st_size))
+            model_path = self._choose_model_file(onnx_files, prefer_int8, provider)
             pf_cfg = sherpa_onnx.OfflineParaformerModelConfig(model=model_path)
             mc = sherpa_onnx.OfflineModelConfig(
                 paraformer=pf_cfg,
@@ -2080,6 +2136,7 @@ class LexiSharpApp:
         provider: str,
         num_threads: int,
         decoding_method: str = "greedy_search",
+        prefer_int8: bool = True,
     ):
         """兼容旧版 sherpa-onnx 的构造方式（from_transducer/from_paraformer/from_whisper）。"""
         import inspect
@@ -2200,9 +2257,7 @@ class LexiSharpApp:
                 factory = getattr(rec_cls, "from_sensevoice", None) or getattr(sherpa_onnx, "from_sensevoice", None)
             if not factory:
                 raise RuntimeError("当前 sherpa-onnx 版本不支持 sense-voice 工厂方法，请升级 sherpa-onnx。")
-            model_path = ""
-            if onnx_files:
-                model_path = str(max(onnx_files, key=lambda p: p.stat().st_size))
+            model_path = self._choose_model_file(onnx_files, prefer_int8, provider)
             return call_with_supported(
                 factory,
                 dict(
@@ -2239,9 +2294,7 @@ class LexiSharpApp:
         factory = getattr(rec_cls, "from_paraformer", None) or getattr(sherpa_onnx, "from_paraformer", None)
         if not factory:
             raise RuntimeError("当前 sherpa-onnx 版本不支持 paraformer 工厂方法，请升级 sherpa-onnx。")
-        model_path = ""
-        if onnx_files:
-            model_path = str(max(onnx_files, key=lambda p: p.stat().st_size))
+        model_path = self._choose_model_file(onnx_files, prefer_int8, provider)
         return call_with_supported(
             factory,
             dict(
@@ -2253,6 +2306,28 @@ class LexiSharpApp:
             model_type,
             {"model": model_path},
         )
+
+    def _choose_model_file(self, onnx_files: list[Path], prefer_int8: bool, provider: str) -> str:
+        """在多个 .onnx 中选择一个主模型文件：
+        - CPU 且 prefer_int8 时优先选择名称包含 int8 的文件；
+        - 否则优先非 int8；
+        - 若未匹配到，回退为体积最大者。
+        """
+        if not onnx_files:
+            return ""
+        names = [p.name.lower() for p in onnx_files]
+        pairs = list(zip(names, onnx_files))
+        if provider == "cpu" and prefer_int8:
+            for n, p in pairs:
+                if "int8" in n:
+                    return str(p)
+        else:
+            # 优先非 int8
+            for n, p in pairs:
+                if "int8" not in n:
+                    return str(p)
+        # 兜底：体积最大
+        return str(max(onnx_files, key=lambda p: p.stat().st_size))
 
     def _auto_paste_async(self) -> AutoPasteResult:
         """自动输入识别结果，优先尝试 DBus，再回退至原有方案。"""
@@ -2869,9 +2944,11 @@ class SettingsDialog:
         # 本地引擎变量（仅在 local_sherpa 使用）
         self.local_variant_var = tk.StringVar(value=str(app.config.get("local_sherpa_variant", "small")))
         self.local_provider_var = tk.StringVar(value=str(app.config.get("local_sherpa_provider", "cpu")))
-        self.local_threads_var = tk.IntVar(value=int(app.config.get("local_sherpa_threads", 2)))
+        self.local_threads_var = tk.IntVar(value=int(app.config.get("local_sherpa_threads", 4)))
         self.local_small_dir_var = tk.StringVar(value=str(app.config.get("local_sherpa_model_dir_small", "")))
         self.local_full_dir_var = tk.StringVar(value=str(app.config.get("local_sherpa_model_dir_full", "")))
+        self.local_prefer_int8_var = tk.BooleanVar(value=bool(app.config.get("local_sherpa_prefer_int8", True)))
+        self.local_trim_silence_var = tk.BooleanVar(value=bool(app.config.get("local_sherpa_trim_silence", False)))
         # 已移除 Hugging Face 仓库配置，仅保留 GitHub Releases 下载
 
         self._render_channel_fields(current_channel)
@@ -3053,6 +3130,20 @@ class SettingsDialog:
         ).pack(side=tk.LEFT, padx=(4, 12))
         tk.Label(row, text="线程数：").pack(side=tk.LEFT)
         tk.Spinbox(row, from_=1, to=16, textvariable=self.local_threads_var, width=5).pack(side=tk.LEFT)
+
+        # 量化优先 & 去静音
+        toggles = tk.Frame(infer_frame)
+        toggles.pack(anchor=tk.W, pady=(6, 2))
+        tk.Checkbutton(
+            toggles,
+            text="优先使用量化模型（CPU 推荐）",
+            variable=self.local_prefer_int8_var
+        ).pack(anchor=tk.W)
+        tk.Checkbutton(
+            toggles,
+            text="去静音（VAD 预裁剪）",
+            variable=self.local_trim_silence_var
+        ).pack(anchor=tk.W)
 
         # 测试本地 WAV 文件
         test_row = tk.Frame(infer_frame)
@@ -3290,9 +3381,11 @@ class SettingsDialog:
             updates.update({
                 "local_sherpa_variant": self.local_variant_var.get().strip().lower() or "small",
                 "local_sherpa_provider": self.local_provider_var.get().strip().lower() or "cpu",
-                "local_sherpa_threads": int(self.local_threads_var.get() or 2),
+                "local_sherpa_threads": int(self.local_threads_var.get() or 4),
                 "local_sherpa_model_dir_small": self.local_small_dir_var.get().strip(),
                 "local_sherpa_model_dir_full": self.local_full_dir_var.get().strip(),
+                "local_sherpa_prefer_int8": bool(self.local_prefer_int8_var.get()),
+                "local_sherpa_trim_silence": bool(self.local_trim_silence_var.get()),
             })
         else:
             fields = self.CHANNEL_FIELDS.get(channel_key, [])
