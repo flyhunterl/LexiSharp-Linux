@@ -4,3 +4,9 @@ pyperclip>=1.8.2
 pynput>=1.7.6
 evdev>=1.6.1
 dbus-next>=0.2.3
+numpy>=1.23
+# 本地离线引擎（sherpa-onnx）可选依赖
+# CPU: onnxruntime；GPU: onnxruntime-gpu（二选一按需安装）
+# 这里默认添加 CPU 版本，若使用 CUDA 可改为 onnxruntime-gpu
+onnxruntime>=1.16.0
+sherpa-onnx>=1.10.22

@@ -26,6 +26,7 @@ from uuid import uuid4
 
 import tkinter as tk
 from tkinter import messagebox, ttk
+from tkinter import filedialog
 
 import pyperclip
 import requests
@@ -41,6 +42,16 @@ try:
     import dashscope  # type: ignore[import]
 except ImportError:  # pragma: no cover - 处理运行时缺失
     dashscope = None
+
+# 本地引擎：sherpa-onnx（可选）
+try:  # pragma: no cover - 运行时动态可用
+    import numpy as np  # 用于音频波形
+    import sherpa_onnx  # 本地离线/流式识别
+except Exception:  # 允许缺失
+    np = None
+    sherpa_onnx = None
+
+#（已移除 Hugging Face 一键下载支持）
 
 try:
     from dbus_next import BusType, Message
@@ -96,7 +107,18 @@ CONFIG_TEMPLATE = {
     "stop_hotkey": "ctrl+alt+s",
     "floating_button_enabled": False,
     "floating_button_size": 96,
-    "type_delay_ms": 5
+    "type_delay_ms": 5,
+    # ===== 本地引擎（sherpa-onnx）相关配置 =====
+    # 当前选择的本地模型规格：small 或 full
+    "local_sherpa_variant": "small",
+    # small/full 各自的安装目录（默认放到用户缓存目录下）
+    # 默认将模型放在配置目录下，避免被系统清理
+    "local_sherpa_model_dir_small": str((CONFIG_DIR / "models/zh-small").as_posix()),
+    "local_sherpa_model_dir_full": str((CONFIG_DIR / "models/zh-full").as_posix()),
+    # 推理提供者与线程数：provider=cpu/cuda；num_threads 控制 onnxruntime 线程
+    "local_sherpa_provider": "cpu",
+    "local_sherpa_threads": 2,
+    # 仅保留 GitHub Releases 下载方式
 }
 
 
@@ -1043,6 +1065,11 @@ class LexiSharpApp:
         self.config_ready: bool = False
         self._config_prompt_shown: bool = False
 
+        # 本地引擎缓存：避免重复加载模型（按配置签名缓存）
+        self._local_sherpa_signature: Optional[str] = None
+        self._local_sherpa_recognizer: Optional[object] = None
+        self._local_sherpa_sr: int = 16000
+
         self._build_ui()
         self._update_floating_controls_state()
         self._schedule_level_update()
@@ -1213,6 +1240,24 @@ class LexiSharpApp:
             api_key = os.environ.get("DASHSCOPE_API_KEY") or config.get("qwen_api_key", "")
             if "在此填写" in str(api_key) or not str(api_key).strip():
                 missing_messages.append("通义千问 API Key（qwen_api_key 或环境变量 DASHSCOPE_API_KEY）")
+        elif channel in {"local_sherpa", "local", "sherpa"}:
+            variant = str(config.get("local_sherpa_variant", "small")).strip().lower()
+            if variant not in {"small", "full"}:
+                variant = "small"
+            model_dir = str(config.get(f"local_sherpa_model_dir_{variant}", "")).strip()
+            if not model_dir:
+                missing_messages.append("未设置本地模型目录（small/full）")
+            else:
+                p = Path(os.path.expanduser(model_dir)).resolve()
+                if not p.exists():
+                    missing_messages.append(f"模型目录不存在：{p}")
+                else:
+                    tokens = list(p.rglob("tokens.txt"))
+                    onnx = list(p.rglob("*.onnx"))
+                    if not tokens:
+                        missing_messages.append("模型缺少 tokens.txt")
+                    if not onnx:
+                        missing_messages.append("模型目录中未发现 .onnx 文件")
         else:
             self.logger.info("检测到自定义渠道：%s，跳过配置校验。", channel)
 
@@ -1409,6 +1454,8 @@ class LexiSharpApp:
             return "Soniox"
         if channel in {"qwen", "tongyi", "tongyiqianwen", "dashscope"}:
             return "通义千问"
+        if channel in {"local_sherpa", "local", "sherpa"}:
+            return "本地模型（sherpa-onnx）"
         return channel or "火山引擎"
 
     def _open_settings(self) -> None:
@@ -1446,6 +1493,8 @@ class LexiSharpApp:
             return self._call_soniox(audio_file)
         if channel in {"qwen", "tongyi", "tongyiqianwen", "dashscope"}:
             return self._call_qwen(audio_file)
+        if channel in {"local_sherpa", "local", "sherpa"}:
+            return self._call_local_sherpa(audio_file)
         raise RuntimeError(f"未识别的识别渠道：{channel}")
 
     def _call_volcengine(self, audio_file: str) -> Optional[str]:
@@ -1779,6 +1828,431 @@ class LexiSharpApp:
                 self.logger.info("通义千问计费时长：%s 秒", duration)
 
         return text
+
+    # ====== 本地离线引擎（sherpa-onnx） ======
+    def _call_local_sherpa(self, audio_file: str) -> Optional[str]:
+        """
+        使用 sherpa-onnx 在本地进行离线识别。
+        设计：
+        - 仅在需要时初始化并缓存识别器，避免重复加载模型导致的冷启动。
+        - 自动检测模型类型（Transducer/Paraformer/Whisper）以适配不同目录结构。
+        - 要求模型目录至少包含 `tokens.txt` 与一个/多个 .onnx 文件。
+        """
+        if sherpa_onnx is None or np is None:
+            raise RuntimeError(
+                "本地引擎不可用：缺少依赖。请执行 `pip install sherpa-onnx onnxruntime numpy` 并重启程序。"
+            )
+
+        variant = (self.config.get("local_sherpa_variant") or "small").strip().lower()
+        if variant not in {"small", "full"}:
+            variant = "small"
+
+        model_dir_key = f"local_sherpa_model_dir_{variant}"
+        model_dir = str(self.config.get(model_dir_key) or "").strip()
+        if not model_dir:
+            raise RuntimeError("未设置本地模型目录，请在“设置”中选择或下载本地模型后重试。")
+        model_dir_path = Path(os.path.expanduser(model_dir)).resolve()
+        if not model_dir_path.exists():
+            raise RuntimeError(f"模型目录不存在：{model_dir_path}")
+
+        # 探测模型文件
+        tokens_path = None
+        onnx_files: list[Path] = []
+        for p in model_dir_path.rglob("*"):
+            if p.is_file():
+                if p.name.lower() == "tokens.txt":
+                    tokens_path = p
+                if p.suffix.lower() == ".onnx":
+                    onnx_files.append(p)
+
+        if not tokens_path:
+            raise RuntimeError("未在模型目录中找到 tokens.txt，请检查模型是否完整。")
+        if not onnx_files:
+            raise RuntimeError("未在模型目录中找到 .onnx 文件，请检查模型是否完整。")
+
+        provider = (self.config.get("local_sherpa_provider") or "cpu").strip().lower()
+        num_threads = max(1, int(self.config.get("local_sherpa_threads", 2)))
+
+        # 根据文件名/数量做粗略类型识别
+        model_type = self._detect_sherpa_model_type(onnx_files)
+
+        # 读取 wav 文件并转为 float32 波形
+        with wave.open(audio_file, "rb") as wf:
+            sr = wf.getframerate()
+            if wf.getnchannels() != 1:
+                raise RuntimeError("当前本地引擎示例仅支持单声道音频，请确保录音为单声道。")
+            if wf.getsampwidth() != 2:
+                raise RuntimeError("需要 16-bit PCM（s16le）音频。")
+            pcm_bytes = wf.readframes(wf.getnframes())
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        if sr != self._local_sherpa_sr:
+            self.logger.warning("采样率不匹配：录音=%d，预期=%d，将按原样送入。", sr, self._local_sherpa_sr)
+
+        # 决策解码策略：paraformer 优先 modified_beam_search；其他优先 greedy
+        methods: list[str]
+        if model_type == "paraformer":
+            # 为兼容旧版 sherpa-onnx，优先使用 greedy，必要时再尝试 beam
+            methods = ["greedy_search", "modified_beam_search"]
+        else:
+            methods = ["greedy_search", "modified_beam_search"]
+
+        last_err: Optional[Exception] = None
+        for dmethod in methods:
+            # 按解码方法构建/复用识别器
+            signature = f"{model_type}|{model_dir_path}|{provider}|{num_threads}|{dmethod}"
+            if signature != self._local_sherpa_signature:
+                self.logger.info(
+                    "初始化本地引擎（%s）(%s)，目录=%s，provider=%s，threads=%d",
+                    model_type,
+                    dmethod,
+                    model_dir_path,
+                    provider,
+                    num_threads,
+                )
+                try:
+                    self._local_sherpa_recognizer = self._build_offline_recognizer(
+                        model_type=model_type,
+                        onnx_files=onnx_files,
+                        tokens_path=str(tokens_path),
+                        provider=provider,
+                        num_threads=num_threads,
+                        decoding_method=dmethod,
+                    )
+                    self._local_sherpa_signature = signature
+                except Exception as exc:
+                    last_err = exc
+                    self.logger.exception("构建识别器失败（%s）", dmethod)
+                    continue
+
+            recognizer = self._local_sherpa_recognizer
+            if recognizer is None:
+                continue
+            try:
+                # Offline 识别流程
+                stream = recognizer.create_stream()  # type: ignore[attr-defined]
+                stream.accept_waveform(sr, samples)  # type: ignore[attr-defined]
+                try:
+                    stream.input_finished()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                try:
+                    recognizer.decode_stream(stream)  # type: ignore[attr-defined]
+                except AttributeError:
+                    try:
+                        recognizer.decode_streams([stream])  # type: ignore[attr-defined]
+                    except Exception:
+                        raise
+                # 获取结果
+                text = None
+                try:
+                    result = recognizer.get_result(stream)  # type: ignore[attr-defined]
+                    text = getattr(result, "text", None) or (result if isinstance(result, str) else None)
+                except Exception:
+                    pass
+                if not text:
+                    try:
+                        text = getattr(stream, "result", None)
+                        text = getattr(text, "text", None) if text is not None else None
+                    except Exception:
+                        text = None
+                text = (text or "").strip()
+                if text:
+                    return text
+                else:
+                    self.logger.warning("解码方法 %s 未返回文本，尝试其他方法…", dmethod)
+            except Exception as exc:
+                last_err = exc
+                self.logger.exception("本地引擎识别失败（%s）", dmethod)
+                continue
+
+        if last_err:
+            raise RuntimeError(f"本地引擎识别失败：{last_err}")
+        return None
+
+    def _detect_sherpa_model_type(self, onnx_files: list[Path]) -> str:
+        """基于路径/文件名推断模型类型，返回 `sense_voice`/`transducer`/`paraformer`/`whisper`。"""
+        names = {p.name.lower() for p in onnx_files}
+        # SenseVoice 专用模型（目录名通常包含 sense-voice）
+        for p in onnx_files:
+            full = str(p).lower()
+            if "sense-voice" in full or "sense_voice" in full:
+                return "sense_voice"
+        if {"encoder.onnx", "decoder.onnx", "joiner.onnx"}.issubset(names):
+            return "transducer"
+        # whisper 常见包含 encoder/decoder 或 whisper-*.onnx
+        if any("whisper" in n for n in names) or {"whisper-encoder.onnx", "whisper-decoder.onnx"}.issubset(names):
+            return "whisper"
+        # 默认按 Paraformer（单文件 model.onnx）处理
+        return "paraformer"
+
+    def _build_offline_recognizer(
+        self,
+        model_type: str,
+        onnx_files: list[Path],
+        tokens_path: str,
+        provider: str,
+        num_threads: int,
+        decoding_method: str = "greedy_search",
+    ):
+        """根据推断的模型类型构建 OfflineRecognizer。"""
+        mc = None
+        tokens = tokens_path
+        if model_type == "transducer":
+            # encoder/decoder/joiner 三件套
+            base = {p.name.lower(): str(p) for p in onnx_files}
+            mc = sherpa_onnx.OfflineModelConfig(
+                transducer=sherpa_onnx.OfflineTransducerModelConfig(
+                    encoder=base.get("encoder.onnx", ""),
+                    decoder=base.get("decoder.onnx", ""),
+                    joiner=base.get("joiner.onnx", ""),
+                ),
+                tokens=tokens,
+                num_threads=num_threads,
+                provider=provider,
+            )
+        elif model_type == "sense_voice":
+            # SenseVoice 专用配置
+            model_path = ""
+            if onnx_files:
+                model_path = str(max(onnx_files, key=lambda p: p.stat().st_size))
+            sv_cfg = sherpa_onnx.OfflineSenseVoiceModelConfig(
+                model=model_path,
+                language="auto",
+                use_itn=False,
+            )
+            mc = sherpa_onnx.OfflineModelConfig(
+                sense_voice=sv_cfg,
+                tokens=tokens,
+                num_threads=num_threads,
+                provider=provider,
+            )
+        elif model_type == "whisper":
+            # 支持合并模型或拆分的 encoder/decoder
+            base = {p.name.lower(): str(p) for p in onnx_files}
+            enc = base.get("whisper-encoder.onnx") or base.get("encoder.onnx") or ""
+            dec = base.get("whisper-decoder.onnx") or base.get("decoder.onnx") or ""
+            # 一些仓库会直接给单模型文件，尝试兜底
+            single = next((str(p) for p in onnx_files if "whisper" in p.name.lower()), "")
+            whisper_cfg = sherpa_onnx.OfflineWhisperModelConfig(
+                encoder=enc,
+                decoder=dec,
+                model=single,
+                language="zh",
+                task="transcribe",
+            )
+            mc = sherpa_onnx.OfflineModelConfig(
+                whisper=whisper_cfg,
+                tokens=tokens,
+                num_threads=num_threads,
+                provider=provider,
+            )
+        else:  # paraformer（默认）
+            model_path = ""
+            # 选取体积最大的 .onnx 作为主模型
+            if onnx_files:
+                model_path = str(max(onnx_files, key=lambda p: p.stat().st_size))
+            pf_cfg = sherpa_onnx.OfflineParaformerModelConfig(model=model_path)
+            mc = sherpa_onnx.OfflineModelConfig(
+                paraformer=pf_cfg,
+                tokens=tokens,
+                num_threads=num_threads,
+                provider=provider,
+            )
+        # 适配新旧 API：优先尝试新版本构造，失败则回退到旧版工厂方法
+        try:
+            return sherpa_onnx.OfflineRecognizer(model_config=mc, decoding_method=decoding_method)
+        except TypeError:
+            # 旧版本兼容路径
+            return self._build_offline_recognizer_legacy(
+                model_type=model_type,
+                onnx_files=onnx_files,
+                tokens_path=tokens,
+                provider=provider,
+                num_threads=num_threads,
+                decoding_method=decoding_method,
+            )
+
+    def _build_offline_recognizer_legacy(
+        self,
+        model_type: str,
+        onnx_files: list[Path],
+        tokens_path: str,
+        provider: str,
+        num_threads: int,
+        decoding_method: str = "greedy_search",
+    ):
+        """兼容旧版 sherpa-onnx 的构造方式（from_transducer/from_paraformer/from_whisper）。"""
+        import inspect
+
+        def call_with_supported(func, params: dict, model_type: str, model_paths: dict):
+            """
+            根据工厂函数签名动态选择参数键：
+            - paraformer：优先传 paraformer=str 路径；否则传 model=str；否则传 config 对象（极少见）
+            - transducer：签名含 encoder/decoder/joiner 则传 3 路径；否则传 transducer=config
+            - whisper：签名含 encoder/decoder/model 则传 3 路径；否则传 whisper=config
+            其他通用参数按签名过滤。
+            """
+            try:
+                sig = inspect.signature(func)
+                param_names = set(sig.parameters.keys())
+            except (TypeError, ValueError):
+                sig = None
+                param_names = set()
+
+            kwargs: dict[str, object] = {}
+            # tokens 总是必填
+            if "tokens" in params:
+                kwargs["tokens"] = params["tokens"]
+            # 仅当能获取到签名且参数名存在时，才传可选参数，避免旧版 C 扩展因未知关键字异常/不确定行为
+            for k in ("num_threads", "provider", "decoding_method", "language", "task"):
+                if sig is not None and k in param_names and k in params:
+                    kwargs[k] = params[k]
+
+            if model_type == "paraformer":
+                model_path = model_paths.get("model", "")
+                if "paraformer" in param_names:
+                    kwargs["paraformer"] = model_path
+                elif "model" in param_names:
+                    kwargs["model"] = model_path
+                else:
+                    # 无法判断，降级为配置对象
+                    kwargs["paraformer"] = sherpa_onnx.OfflineParaformerModelConfig(model=model_path)
+            elif model_type == "transducer":
+                if {"encoder", "decoder", "joiner"}.issubset(param_names):
+                    kwargs.update({
+                        "encoder": model_paths.get("encoder", ""),
+                        "decoder": model_paths.get("decoder", ""),
+                        "joiner": model_paths.get("joiner", ""),
+                    })
+                else:
+                    kwargs["transducer"] = sherpa_onnx.OfflineTransducerModelConfig(
+                        encoder=model_paths.get("encoder", ""),
+                        decoder=model_paths.get("decoder", ""),
+                        joiner=model_paths.get("joiner", ""),
+                    )
+            elif model_type == "whisper":
+                if {"encoder", "decoder", "model"}.issubset(param_names):
+                    kwargs.update({
+                        "encoder": model_paths.get("encoder", ""),
+                        "decoder": model_paths.get("decoder", ""),
+                        "model": model_paths.get("model", ""),
+                    })
+                    if "language" in param_names and "language" not in kwargs:
+                        kwargs["language"] = "zh"
+                    if "task" in param_names and "task" not in kwargs:
+                        kwargs["task"] = "transcribe"
+                else:
+                    kwargs["whisper"] = sherpa_onnx.OfflineWhisperModelConfig(
+                        encoder=model_paths.get("encoder", ""),
+                        decoder=model_paths.get("decoder", ""),
+                        model=model_paths.get("model", ""),
+                        language=kwargs.get("language", "zh"),
+                        task=kwargs.get("task", "transcribe"),
+                    )
+            else:  # sense_voice
+                # 旧版 from_sense_voice 一般签名为 (tokens, model, language?, use_itn?, num_threads?, provider?, decoding_method?)
+                # 因此优先传 model=路径；再按签名选择 language/use_itn 等
+                if sig is None or "model" in param_names:
+                    kwargs["model"] = model_paths.get("model", "")
+                    if sig is not None and "language" in param_names and "language" not in kwargs:
+                        kwargs["language"] = "auto"
+                    if sig is not None and "use_itn" in param_names and "use_itn" not in kwargs:
+                        kwargs["use_itn"] = False
+                else:
+                    # 极少数特殊命名，尝试 sense_voice_model
+                    if "sense_voice_model" in param_names:
+                        kwargs["sense_voice_model"] = model_paths.get("model", "")
+                    else:
+                        # 最后兜底：构造配置对象（万一该版本支持）
+                        kwargs["model"] = model_paths.get("model", "")
+
+            return func(**kwargs)
+
+        tokens = tokens_path
+        names = {p.name.lower(): str(p) for p in onnx_files}
+
+        # 优先从类方法查找；否则从模块级函数兜底
+        rec_cls = getattr(sherpa_onnx, "OfflineRecognizer", None)
+        factory = None
+        if model_type == "transducer":
+            factory = getattr(rec_cls, "from_transducer", None) or getattr(sherpa_onnx, "from_transducer", None)
+            if not factory:
+                raise RuntimeError("当前 sherpa-onnx 版本不支持 transducer 工厂方法，请升级 sherpa-onnx。")
+            return call_with_supported(
+                factory,
+                dict(
+                    tokens=tokens,
+                    num_threads=num_threads,
+                    provider=provider,
+                    decoding_method=decoding_method,
+                ),
+                model_type,
+                {
+                    "encoder": names.get("encoder.onnx", ""),
+                    "decoder": names.get("decoder.onnx", ""),
+                    "joiner": names.get("joiner.onnx", ""),
+                },
+            )
+        if model_type == "sense_voice":
+            factory = getattr(rec_cls, "from_sense_voice", None) or getattr(sherpa_onnx, "from_sense_voice", None)
+            if not factory:
+                # 某些版本可能使用 from_sensevoice 命名，尝试兜底
+                factory = getattr(rec_cls, "from_sensevoice", None) or getattr(sherpa_onnx, "from_sensevoice", None)
+            if not factory:
+                raise RuntimeError("当前 sherpa-onnx 版本不支持 sense-voice 工厂方法，请升级 sherpa-onnx。")
+            model_path = ""
+            if onnx_files:
+                model_path = str(max(onnx_files, key=lambda p: p.stat().st_size))
+            return call_with_supported(
+                factory,
+                dict(
+                    tokens=tokens,
+                    num_threads=num_threads,
+                    provider=provider,
+                    decoding_method=decoding_method,
+                    language="auto",
+                    use_itn=False,
+                ),
+                model_type,
+                {"model": model_path},
+            )
+        if model_type == "whisper":
+            factory = getattr(rec_cls, "from_whisper", None) or getattr(sherpa_onnx, "from_whisper", None)
+            if not factory:
+                raise RuntimeError("当前 sherpa-onnx 版本不支持 whisper 工厂方法，请升级 sherpa-onnx。")
+            return call_with_supported(
+                factory,
+                dict(
+                    tokens=tokens,
+                    num_threads=num_threads,
+                    provider=provider,
+                    decoding_method=decoding_method,
+                ),
+                model_type,
+                {
+                    "encoder": names.get("whisper-encoder.onnx") or names.get("encoder.onnx", ""),
+                    "decoder": names.get("whisper-decoder.onnx") or names.get("decoder.onnx", ""),
+                    "model": next((v for k, v in names.items() if "whisper" in k), ""),
+                },
+            )
+        # paraformer 默认
+        factory = getattr(rec_cls, "from_paraformer", None) or getattr(sherpa_onnx, "from_paraformer", None)
+        if not factory:
+            raise RuntimeError("当前 sherpa-onnx 版本不支持 paraformer 工厂方法，请升级 sherpa-onnx。")
+        model_path = ""
+        if onnx_files:
+            model_path = str(max(onnx_files, key=lambda p: p.stat().st_size))
+        return call_with_supported(
+            factory,
+            dict(
+                tokens=tokens,
+                num_threads=num_threads,
+                provider=provider,
+                decoding_method=decoding_method,
+            ),
+            model_type,
+            {"model": model_path},
+        )
 
     def _auto_paste_async(self) -> AutoPasteResult:
         """自动输入识别结果，优先尝试 DBus，再回退至原有方案。"""
@@ -2165,6 +2639,7 @@ class SettingsDialog:
         ("volcengine", "火山引擎（Volcengine）"),
         ("soniox", "Soniox"),
         ("qwen", "通义千问（Qwen）"),
+        ("local_sherpa", "本地模型（sherpa-onnx）"),
     ]
 
     CHANNEL_FIELDS: dict[str, list[dict[str, object]]] = {
@@ -2391,6 +2866,14 @@ class SettingsDialog:
         except Exception:
             self.app.logger.exception("注册设置窗口失败")
 
+        # 本地引擎变量（仅在 local_sherpa 使用）
+        self.local_variant_var = tk.StringVar(value=str(app.config.get("local_sherpa_variant", "small")))
+        self.local_provider_var = tk.StringVar(value=str(app.config.get("local_sherpa_provider", "cpu")))
+        self.local_threads_var = tk.IntVar(value=int(app.config.get("local_sherpa_threads", 2)))
+        self.local_small_dir_var = tk.StringVar(value=str(app.config.get("local_sherpa_model_dir_small", "")))
+        self.local_full_dir_var = tk.StringVar(value=str(app.config.get("local_sherpa_model_dir_full", "")))
+        # 已移除 Hugging Face 仓库配置，仅保留 GitHub Releases 下载
+
         self._render_channel_fields(current_channel)
 
     def _on_channel_change(self, _event=None) -> None:
@@ -2405,6 +2888,12 @@ class SettingsDialog:
         for child in self.channel_frame.winfo_children():
             child.destroy()
         self.field_widgets.clear()
+
+        # 本地引擎自渲染
+        if channel == "local_sherpa":
+            self._render_local_sherpa_panel()
+            self._update_scroll_region()
+            return
 
         fields = self.CHANNEL_FIELDS.get(channel, [])
         if not fields:
@@ -2476,6 +2965,312 @@ class SettingsDialog:
 
         self._update_scroll_region()
 
+    # ===== 本地模型（sherpa-onnx）设置面板 =====
+    def _render_local_sherpa_panel(self) -> None:
+        title = tk.Label(
+            self.channel_frame,
+            text="本地模型选择",
+            font=("WenQuanYi Micro Hei", 12, "bold")
+        )
+        title.pack(anchor=tk.W, pady=(0, 6))
+
+        # small / full 单选
+        variant_frame = tk.Frame(self.channel_frame)
+        variant_frame.pack(anchor=tk.W, pady=(0, 6), fill=tk.X)
+        tk.Radiobutton(
+            variant_frame,
+            text="small（小模型≈300MB，INT8，速度优先）",
+            variable=self.local_variant_var,
+            value="small",
+            command=self._update_local_status
+        ).pack(anchor=tk.W)
+        tk.Radiobutton(
+            variant_frame,
+            text="full（大模型≈900MB，FP，准确度优先）",
+            variable=self.local_variant_var,
+            value="full",
+            command=self._update_local_status
+        ).pack(anchor=tk.W)
+
+        # 目录与状态
+        path_frame = tk.Frame(self.channel_frame)
+        path_frame.pack(anchor=tk.W, pady=(6, 2), fill=tk.X)
+        tk.Label(path_frame, text="模型目录：").pack(side=tk.LEFT)
+        self.local_path_entry = tk.Entry(path_frame, width=36)
+        self.local_path_entry.pack(side=tk.LEFT, padx=(4, 4))
+        tk.Button(path_frame, text="选择…", command=self._browse_local_dir).pack(side=tk.LEFT)
+
+        self.local_status_label = tk.Label(
+            self.channel_frame,
+            text="正在检测模型…",
+            fg="#666666",
+            wraplength=360,
+            justify=tk.LEFT
+        )
+        self.local_status_label.pack(anchor=tk.W, pady=(4, 8))
+
+        # GitHub Releases 下载（支持加速）
+        gh_frame = tk.LabelFrame(self.channel_frame, text="从 GitHub Releases 下载（支持加速，程序自动解压配置）")
+        gh_frame.pack(anchor=tk.W, fill=tk.X, pady=(4, 8))
+
+        url_row = tk.Frame(gh_frame)
+        url_row.pack(anchor=tk.W, pady=(4, 2), fill=tk.X)
+        tk.Label(url_row, text="GitHub 直链：").pack(side=tk.LEFT)
+        self.github_url_entry = tk.Entry(url_row, width=36)
+        self.github_url_entry.pack(side=tk.LEFT, padx=(4, 4))
+
+        accel_row = tk.Frame(gh_frame)
+        accel_row.pack(anchor=tk.W, pady=(2, 2), fill=tk.X)
+        tk.Label(accel_row, text="加速：").pack(side=tk.LEFT)
+        self.github_accel_var = tk.StringVar(value="gh-proxy.com")
+        ttk.Combobox(
+            accel_row,
+            textvariable=self.github_accel_var,
+            state="readonly",
+            values=["无加速", "gh-proxy.com", "edgeone.gh-proxy.com"],
+            width=22
+        ).pack(side=tk.LEFT, padx=(4, 12))
+        tk.Button(accel_row, text="下载/更新", command=self._download_via_github).pack(side=tk.LEFT)
+
+        tip2 = (
+            "若网络较慢，推荐选择 gh-proxy.com 或 edgeone.gh-proxy.com 进行加速。\n"
+            "下载完成后会自动解压到当前规格目录并生效。"
+        )
+        tk.Label(gh_frame, text=tip2, fg="#666666", justify=tk.LEFT, wraplength=360).pack(anchor=tk.W, pady=(2, 2))
+
+        # 推理参数
+        infer_frame = tk.LabelFrame(self.channel_frame, text="推理设置")
+        infer_frame.pack(anchor=tk.W, fill=tk.X, pady=(4, 8))
+        row = tk.Frame(infer_frame)
+        row.pack(anchor=tk.W, pady=(2, 2))
+        tk.Label(row, text="执行提供者：").pack(side=tk.LEFT)
+        ttk.Combobox(
+            row,
+            textvariable=self.local_provider_var,
+            state="readonly",
+            values=["cpu", "cuda"],
+            width=10
+        ).pack(side=tk.LEFT, padx=(4, 12))
+        tk.Label(row, text="线程数：").pack(side=tk.LEFT)
+        tk.Spinbox(row, from_=1, to=16, textvariable=self.local_threads_var, width=5).pack(side=tk.LEFT)
+
+        # 测试本地 WAV 文件
+        test_row = tk.Frame(infer_frame)
+        test_row.pack(anchor=tk.W, pady=(6, 2))
+        tk.Button(test_row, text="选择本地 WAV 测试识别…", command=self._test_local_wav).pack(side=tk.LEFT)
+
+        self._update_local_status()
+
+    def _current_variant_dir_var(self) -> tk.StringVar:
+        """根据 small/full 返回目录变量。"""
+        if self.local_variant_var.get() == "full":
+            return self.local_full_dir_var
+        return self.local_small_dir_var
+
+    def _update_local_status(self) -> None:
+        # 同步路径输入框
+        dir_var = self._current_variant_dir_var()
+        # 若目录为空或仍为历史默认缓存路径，自动切换到配置目录
+        try:
+            current_dir = (dir_var.get() or "").strip()
+        except Exception:
+            current_dir = ""
+        if (not current_dir) or (".cache/lexisharp-local-asr" in current_dir):
+            variant = self.local_variant_var.get().strip().lower()
+            new_dir = (CONFIG_DIR / ("models/zh-full" if variant == "full" else "models/zh-small")).as_posix()
+            dir_var.set(new_dir)
+        self.local_path_entry.delete(0, tk.END)
+        self.local_path_entry.insert(0, dir_var.get())
+
+        # 设置默认 GitHub 直链
+        variant = self.local_variant_var.get().strip().lower()
+        default_url = ""
+        if variant == "small":
+            default_url = (
+                "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+                "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09.tar.bz2"
+            )
+        else:
+            default_url = (
+                "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+                "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2"
+            )
+        try:
+            current_text = self.github_url_entry.get().strip()
+        except Exception:
+            current_text = ""
+        # 若为空或是上一个规格的默认值，则覆盖为当前规格默认
+        if not current_text or "sherpa-onnx-sense-voice-zh-en-ja-ko-yue" in current_text:
+            self.github_url_entry.delete(0, tk.END)
+            self.github_url_entry.insert(0, default_url)
+
+        # 检查安装状态
+        path = os.path.expanduser(dir_var.get())
+        p = Path(path)
+        if not p.exists():
+            self.local_status_label.configure(text="未检测到模型。点击“下载/更新”或选择本地目录导入。", fg="#D32F2F")
+            return
+        tokens = list(p.rglob("tokens.txt"))
+        onnx = list(p.rglob("*.onnx"))
+        if tokens and onnx:
+            self.local_status_label.configure(text=f"已安装：{p}\n包含 {len(onnx)} 个 ONNX 文件。", fg="#388E3C")
+        else:
+            missing = []
+            if not tokens:
+                missing.append("tokens.txt")
+            if not onnx:
+                missing.append("*.onnx")
+            self.local_status_label.configure(text=f"目录不完整，缺少：{', '.join(missing)}", fg="#D32F2F")
+
+    def _browse_local_dir(self) -> None:
+        directory = filedialog.askdirectory(title="选择本地模型目录")
+        if not directory:
+            return
+        dir_var = self._current_variant_dir_var()
+        dir_var.set(directory)
+        self._update_local_status()
+
+    def _test_local_wav(self) -> None:
+        path = filedialog.askopenfilename(
+            title="选择 WAV 文件",
+            filetypes=[("WAV 文件", "*.wav"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        # 后台线程执行，避免阻塞 UI
+        def worker():
+            try:
+                self.app.status_var.set("测试识别中…")
+                text = self.app._call_asr(path)
+                if text:
+                    self.app._refresh_result(text)
+                    messagebox.showinfo("测试识别结果", text)
+                else:
+                    messagebox.showwarning("测试识别", "未获得识别结果，请检查模型与音频。")
+            except Exception as exc:
+                self.app.logger.exception("测试识别失败")
+                messagebox.showerror("测试识别失败", str(exc))
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _download_via_github(self) -> None:
+        import threading, tarfile
+        from urllib.parse import urlparse
+
+        def _set_status(text: str, color: str = "#666666") -> None:
+            try:
+                self.local_status_label.configure(text=text, fg=color)
+            except Exception:
+                pass
+
+        raw_url = self.github_url_entry.get().strip()
+        if not raw_url or not raw_url.startswith("https://github.com/"):
+            messagebox.showwarning("下载", "请填写有效的 GitHub 直链（以 https://github.com/ 开头）。")
+            return
+
+        accel = self.github_accel_var.get().strip()
+        final_url = raw_url
+        if accel == "gh-proxy.com":
+            final_url = f"https://gh-proxy.com/{raw_url}"
+        elif accel == "edgeone.gh-proxy.com":
+            final_url = f"https://edgeone.gh-proxy.com/{raw_url}"
+
+        dir_var = self._current_variant_dir_var()
+        target_dir = Path(os.path.expanduser(dir_var.get()))
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        parsed = urlparse(raw_url)
+        fname = Path(parsed.path).name or "model.tar.bz2"
+        tar_path = target_dir / fname
+
+        def worker() -> None:
+            try:
+                _set_status("开始下载模型（GitHub）…", "#666666")
+                with requests.get(final_url, stream=True, timeout=30) as r:
+                    r.raise_for_status()
+                    total = int(r.headers.get("Content-Length", 0))
+                    downloaded = 0
+                    with open(tar_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=1024 * 1024):
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if total:
+                                mb = downloaded / (1024 * 1024)
+                                tmb = total / (1024 * 1024)
+                                self.window.after(0, _set_status, f"下载中… {mb:.1f}/{tmb:.1f} MB", "#666666")
+                # 解压
+                _set_status("下载完成，正在解压…", "#666666")
+                try:
+                    with tarfile.open(tar_path, mode="r:bz2") as tf:
+                        tf.extractall(path=target_dir)
+                except tarfile.ReadError:
+                    # 不是 tar.bz2，忽略解压
+                    pass
+                try:
+                    tar_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                # 自动保存配置并启用本地模型
+                self.window.after(0, _set_status, f"模型已安装：{target_dir}，正在应用配置…", "#388E3C")
+                self.window.after(0, self._apply_local_config_and_enable)
+                self.window.after(200, self._update_local_status)
+            except requests.RequestException as exc:
+                self.app.logger.exception("GitHub 下载失败")
+                self.window.after(0, _set_status, f"下载失败：{exc}", "#D32F2F")
+                # 若使用加速失败，尝试回退原链一次
+                if final_url != raw_url:
+                    try:
+                        with requests.get(raw_url, stream=True, timeout=30) as r:
+                            r.raise_for_status()
+                            with open(tar_path, "wb") as f:
+                                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                                    if chunk:
+                                        f.write(chunk)
+                        self.window.after(0, _set_status, "加速失败，已回退直链并下载完成，正在解压…", "#666666")
+                        import tarfile as _tarfile
+                        try:
+                            with _tarfile.open(tar_path, mode="r:bz2") as tf:
+                                tf.extractall(path=target_dir)
+                        except _tarfile.ReadError:
+                            pass
+                        try:
+                            tar_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        self.window.after(0, _set_status, f"模型已安装：{target_dir}，正在应用配置…", "#388E3C")
+                        self.window.after(0, self._apply_local_config_and_enable)
+                        self.window.after(200, self._update_local_status)
+                    except Exception as exc2:
+                        self.app.logger.exception("GitHub 直链回退仍失败")
+                        self.window.after(0, _set_status, f"下载失败：{exc2}", "#D32F2F")
+            except Exception as exc:
+                self.app.logger.exception("下载流程异常")
+                self.window.after(0, _set_status, f"下载异常：{exc}", "#D32F2F")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_local_config_and_enable(self) -> None:
+        """下载解压成功后，自动保存配置并启用本地模型，尽量做到“一键即可用”。"""
+        try:
+            updates: dict[str, object] = {
+                "channel": "local_sherpa",
+                "local_sherpa_variant": self.local_variant_var.get().strip().lower() or "small",
+                "local_sherpa_provider": self.local_provider_var.get().strip().lower() or "cpu",
+                "local_sherpa_threads": int(self.local_threads_var.get() or 2),
+                "local_sherpa_model_dir_small": self.local_small_dir_var.get().strip(),
+                "local_sherpa_model_dir_full": self.local_full_dir_var.get().strip(),
+            }
+            self.app.config.update(updates)
+            save_config(self.app.config)
+            # 立即生效
+            self.app._validate_keys(trigger_prompt=False)
+            provider_name = self.app._channel_display_name()
+            self.app.status_var.set(f"配置已自动保存，当前识别渠道：{provider_name}。")
+        except Exception:
+            self.app.logger.exception("自动保存与启用本地模型失败")
+
     def _get_config_value(self, key: str, field: dict[str, object]):
         if key in self.app.config:
             value = self.app.config[key]
@@ -2490,40 +3285,50 @@ class SettingsDialog:
     def _save(self) -> None:
         channel_key = self._get_selected_channel_key()
         updates: dict[str, object] = {"channel": channel_key}
-        fields = self.CHANNEL_FIELDS.get(channel_key, [])
+        if channel_key == "local_sherpa":
+            # 从自定义控件收集配置
+            updates.update({
+                "local_sherpa_variant": self.local_variant_var.get().strip().lower() or "small",
+                "local_sherpa_provider": self.local_provider_var.get().strip().lower() or "cpu",
+                "local_sherpa_threads": int(self.local_threads_var.get() or 2),
+                "local_sherpa_model_dir_small": self.local_small_dir_var.get().strip(),
+                "local_sherpa_model_dir_full": self.local_full_dir_var.get().strip(),
+            })
+        else:
+            fields = self.CHANNEL_FIELDS.get(channel_key, [])
 
-        for field in fields:
-            key = field["key"]  # type: ignore[index]
-            stored = self.field_widgets.get(key)
-            if not stored:
-                continue
-            widget = stored.get("widget")
-            entry_type = field.get("type")
+            for field in fields:
+                key = field["key"]  # type: ignore[index]
+                stored = self.field_widgets.get(key)
+                if not stored:
+                    continue
+                widget = stored.get("widget")
+                entry_type = field.get("type")
 
-            if entry_type == "entry":
-                value_str = widget.get().strip() if isinstance(widget, tk.Entry) else ""
-                if field.get("list"):
-                    value = [item.strip() for item in value_str.split(",") if item.strip()]
-                elif field.get("value_type") is float:
-                    if not value_str:
-                        value_str = str(field.get("default", CONFIG_TEMPLATE.get(key, 0.0)))
-                    try:
-                        value = float(value_str)
-                    except ValueError:
-                        messagebox.showerror("设置", f"{field['label']} 需要填写数字。")  # type: ignore[index]
-                        if isinstance(widget, tk.Entry):
-                            widget.focus_set()
-                        return
-                else:
-                    value = value_str
-                updates[key] = value
-            elif entry_type == "boolean":
-                var = stored.get("variable")
-                if isinstance(var, tk.BooleanVar):
-                    updates[key] = bool(var.get())
-            elif entry_type == "text":
-                if isinstance(widget, tk.Text):
-                    updates[key] = widget.get("1.0", tk.END).strip()
+                if entry_type == "entry":
+                    value_str = widget.get().strip() if isinstance(widget, tk.Entry) else ""
+                    if field.get("list"):
+                        value = [item.strip() for item in value_str.split(",") if item.strip()]
+                    elif field.get("value_type") is float:
+                        if not value_str:
+                            value_str = str(field.get("default", CONFIG_TEMPLATE.get(key, 0.0)))
+                        try:
+                            value = float(value_str)
+                        except ValueError:
+                            messagebox.showerror("设置", f"{field['label']} 需要填写数字。")  # type: ignore[index]
+                            if isinstance(widget, tk.Entry):
+                                widget.focus_set()
+                            return
+                    else:
+                        value = value_str
+                    updates[key] = value
+                elif entry_type == "boolean":
+                    var = stored.get("variable")
+                    if isinstance(var, tk.BooleanVar):
+                        updates[key] = bool(var.get())
+                elif entry_type == "text":
+                    if isinstance(widget, tk.Text):
+                        updates[key] = widget.get("1.0", tk.END).strip()
 
         candidate_config = dict(self.app.config)
         candidate_config.update(updates)

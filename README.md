@@ -2,6 +2,7 @@
 
 LexiSharp-linux 是一款运行于 Linux 桌面的轻量级语音输入工具，围绕“录音 → 识别 → 粘贴”这一流程展开，实现最小成本的语音转文字体验。
 支持火山引擎、通义千问、Soniox的ASR模型。
+新增：可选接入本地离线引擎 sherpa-onnx（small/full 一键配置与导入；支持 GitHub 加速下载与自动解压配置）。
 项目灵感来源于安卓版LexiSharp。安卓版版本已经是一个非常完善且功能强大的版本！地址：https://github.com/BryceWG/LexiSharp-Keyboard
 
 
@@ -66,7 +67,14 @@ pip install -r requirements.txt
 ## 识别渠道配置
 
 ### 通过设置界面设置
-当前版本已支持可视化设置，通过设置按钮进入设置，如需更多的设置可以参考下面手动配置。
+当前版本已支持可视化设置，通过设置按钮进入设置。如需更多设置可参考下文。
+
+- 本地离线（sherpa-onnx）：选择“本地模型（sherpa-onnx）”，在 small/full 两个规格间切换；若未安装，可直接使用 GitHub Releases 直链下载（程序支持自动解压与配置），或选择本地模型目录导入（目录内需包含 tokens.txt 与一个或多个 .onnx 模型文件）。在中国大陆网络环境可选择 `gh-proxy.com` 或 `edgeone.gh-proxy.com` 前缀加速。
+  - 也可从 GitHub Releases 直接下载模型包（.tar.bz2），程序支持自动解压与配置；在中国大陆网络环境可选择 `gh-proxy.com` 或 `edgeone.gh-proxy.com` 加速前缀。
+  - 预设默认链接：
+    - small（≈300MB，INT8）：https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09.tar.bz2
+    - full（≈900MB，FP）：https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2
+  - 加速示例：将任一 GitHub 直链前缀改为 `https://gh-proxy.com/` 或 `https://edgeone.gh-proxy.com/` 即可。
 
 ### 手动配置
 通过 `~/.lexisharp-linux/config.json` 中的 `channel` 字段选择识别服务：
@@ -74,6 +82,7 @@ pip install -r requirements.txt
 - `volcengine`（默认）：火山引擎大模型录音文件极速版 API。
 - `soniox`：Soniox Speech-to-Text Async API（参考 https://soniox.com/docs/stt/get-started）。
 - `qwen`：通义千问录音文件识别（Qwen3-ASR/Qwen-Audio-ASR，参考 https://help.aliyun.com/zh/model-studio/qwen-speech-recognition）。
+- `local_sherpa`：本地离线识别（sherpa-onnx）。需安装 `sherpa-onnx onnxruntime numpy`，并准备模型目录（见设置说明）。
 
 首次运行 `python lexisharp.py` 会生成配置模板，核心字段示例如下（Soniox 相关字段在使用火山引擎时可保持默认）：
 
