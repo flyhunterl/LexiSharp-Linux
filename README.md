@@ -258,7 +258,5 @@ chmod +x lexisharp.sh
   ```
   对应在配置中设置 `"arecord_device"` 为 `plughw:1,0`。
 - **日志文件**：程序日志保存在.lexisharp-linux/目录下，遇到问题可以先检查log文件
-## 即将实现：
-- 支持更多第三方 ASR 服务或本地模型。
-- 改进 UI 体验与配置流程。
-- 提供更完善的自动粘贴兼容方案。
+<img width="300" height="300" alt="image" src="https://github.com/user-attachments/assets/4a716fd5-dc61-4a4f-b968-91626debe8d2" />
+
