@@ -29,6 +29,11 @@ else
     echo "请检查虚拟环境路径是否正确，或是否已创建该虚拟环境。" >&2
     exit 1
 fi
+# 修复本地 SenseVoice 模型停止录音时报 modified_beam_search 的问题
+# sherpa-onnx 的 SenseVoice 离线识别目前只支持 greedy_search
+if [ -f lexisharp.py ]; then
+    sed -i 's/modified_beam_search/greedy_search/g' lexisharp.py || true
+fi
 
 # 3. 运行您的 Python 项目
 echo "正在运行 lexisharp.py..."
